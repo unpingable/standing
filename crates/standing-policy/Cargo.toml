@@ -1,0 +1,13 @@
+[package]
+name = "standing-policy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+standing-receipt = { workspace = true }
+standing-grant = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

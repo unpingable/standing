@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/standing-receipt",
+    "crates/standing-grant",
+    "crates/standing-policy",
+    "crates/standing-identity",
+    "crates/standing-store",
+    "crates/standing-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+standing-receipt = { path = "crates/standing-receipt" }
+standing-grant = { path = "crates/standing-grant" }
+standing-policy = { path = "crates/standing-policy" }
+standing-identity = { path = "crates/standing-identity" }
+standing-store = { path = "crates/standing-store" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
