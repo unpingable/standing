@@ -204,86 +204,48 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             }
         }
         GrantAction::Activate { id } => {
-            // For slice 1: we rebuild from stored state. This is ugly but true.
-            // A proper implementation would load the GrantMachine from the chain.
-            // For now: just record the transition directly.
-            let grant_id: uuid::Uuid = id.parse()?;
-            let chain = store.receipt_chain(&id)?;
-            if chain.is_empty() {
-                return Err("no receipts found for this grant".into());
-            }
-
-            let tip = chain.last().unwrap();
-            let receipt = standing_receipt::ReceiptBuilder::new(
-                standing_receipt::ReceiptKind::GrantActivated,
-                &tip.actor,
+            let grant = store.get_grant(&id)?
+                .ok_or_else(|| format!("grant not found: {id}"))?;
+            let result = store.transition(
                 &id,
-            )
-            .parent_digest(&tip.digest)
-            .build()?;
-
-            store.record_transition(
-                grant_id,
-                &standing_grant::GrantState::Active,
-                &receipt,
+                standing_grant::GrantState::Active,
+                standing_receipt::ReceiptKind::GrantActivated,
+                &grant.actor,
+                serde_json::Value::Null,
                 None,
             )?;
             println!("activated {id}");
-            println!("  receipt: {}", receipt.digest);
+            println!("  receipt: {}", result.receipt_digest);
         }
         GrantAction::Use { id, evidence } => {
-            let grant_id: uuid::Uuid = id.parse()?;
-            let chain = store.receipt_chain(&id)?;
-            if chain.is_empty() {
-                return Err("no receipts found for this grant".into());
-            }
-
-            let tip = chain.last().unwrap();
+            let grant = store.get_grant(&id)?
+                .ok_or_else(|| format!("grant not found: {id}"))?;
             let evidence: serde_json::Value = serde_json::from_str(&evidence)?;
-            let receipt = standing_receipt::ReceiptBuilder::new(
-                standing_receipt::ReceiptKind::GrantUsed,
-                &tip.actor,
+            let result = store.transition(
                 &id,
-            )
-            .parent_digest(&tip.digest)
-            .evidence(evidence)
-            .build()?;
-
-            store.record_transition(
-                grant_id,
-                &standing_grant::GrantState::Used,
-                &receipt,
+                standing_grant::GrantState::Used,
+                standing_receipt::ReceiptKind::GrantUsed,
+                &grant.actor,
+                evidence,
                 None,
             )?;
             println!("used {id}");
-            println!("  receipt: {}", receipt.digest);
+            println!("  receipt: {}", result.receipt_digest);
         }
         GrantAction::Revoke { id, reason } => {
-            let grant_id: uuid::Uuid = id.parse()?;
-            let chain = store.receipt_chain(&id)?;
-            if chain.is_empty() {
-                return Err("no receipts found for this grant".into());
-            }
-
-            let tip = chain.last().unwrap();
-            let receipt = standing_receipt::ReceiptBuilder::new(
-                standing_receipt::ReceiptKind::GrantRevoked,
-                &tip.actor,
+            let grant = store.get_grant(&id)?
+                .ok_or_else(|| format!("grant not found: {id}"))?;
+            let result = store.transition(
                 &id,
-            )
-            .parent_digest(&tip.digest)
-            .evidence(serde_json::json!({"reason": reason}))
-            .build()?;
-
-            store.record_transition(
-                grant_id,
-                &standing_grant::GrantState::Revoked,
-                &receipt,
+                standing_grant::GrantState::Revoked,
+                standing_receipt::ReceiptKind::GrantRevoked,
+                &grant.actor,
+                serde_json::json!({"reason": reason}),
                 None,
             )?;
             println!("revoked {id}");
             println!("  reason: {reason}");
-            println!("  receipt: {}", receipt.digest);
+            println!("  receipt: {}", result.receipt_digest);
         }
         GrantAction::List { state } => {
             let grants = store.list_grants(state.as_deref())?;

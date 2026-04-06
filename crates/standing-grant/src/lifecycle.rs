@@ -41,6 +41,51 @@ impl GrantState {
                 | GrantState::Abandoned
         )
     }
+
+    /// The allowed transitions from this state.
+    pub fn allowed_transitions(&self) -> &[GrantState] {
+        match self {
+            GrantState::Requested => &[GrantState::Issued, GrantState::Denied],
+            GrantState::Issued => &[
+                GrantState::Active,
+                GrantState::Expired,
+                GrantState::Revoked,
+                GrantState::Abandoned,
+            ],
+            GrantState::Active => &[
+                GrantState::Used,
+                GrantState::Expired,
+                GrantState::Revoked,
+                GrantState::Abandoned,
+            ],
+            // Terminal states allow no transitions
+            GrantState::Used
+            | GrantState::Expired
+            | GrantState::Revoked
+            | GrantState::Denied
+            | GrantState::Abandoned => &[],
+        }
+    }
+
+    /// Can this state transition to `target`?
+    pub fn can_transition_to(&self, target: &GrantState) -> bool {
+        self.allowed_transitions().contains(target)
+    }
+
+    /// Parse from the string form used in storage.
+    pub fn from_str(s: &str) -> Option<GrantState> {
+        match s {
+            "requested" => Some(GrantState::Requested),
+            "issued" => Some(GrantState::Issued),
+            "active" => Some(GrantState::Active),
+            "used" => Some(GrantState::Used),
+            "expired" => Some(GrantState::Expired),
+            "revoked" => Some(GrantState::Revoked),
+            "denied" => Some(GrantState::Denied),
+            "abandoned" => Some(GrantState::Abandoned),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for GrantState {
