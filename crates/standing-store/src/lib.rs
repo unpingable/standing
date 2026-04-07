@@ -7,6 +7,8 @@
 //! Invariant: no state transition without a valid receipt, no receipt without
 //! a valid transition. Both are written atomically or neither is.
 
+pub mod replay;
+
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Transaction};
 use uuid::Uuid;
@@ -58,6 +60,11 @@ impl Store {
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Get a replay guard backed by this store's database.
+    pub fn replay_guard(&self) -> Result<replay::SqliteReplayGuard<'_>, StoreError> {
+        Ok(replay::SqliteReplayGuard::new(&self.conn)?)
     }
 
     /// Open an in-memory store (for testing).

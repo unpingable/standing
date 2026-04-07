@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use standing_grant::{ActorContext, GrantMachine, GrantRequest, GrantScope, Principal};
-use standing_identity::{WorkloadId, verify_and_resolve, CreateOptions, VerifyOptions};
+use standing_identity::{WorkloadId, verify_and_resolve, verify_and_resolve_with_replay, CreateOptions, ReplayGuard, VerifyOptions};
 use standing_policy::{HardcodedPolicy, PolicyEvaluator, Verdict};
 use standing_store::{GrantMeta, Store};
 
@@ -183,13 +183,14 @@ fn main() {
 fn resolve_identity(
     identity_path: &str,
     secret: &str,
+    replay_guard: Option<&mut dyn ReplayGuard>,
 ) -> Result<(Principal, WorkloadId), Box<dyn std::error::Error>> {
     let data = std::fs::read_to_string(identity_path)
         .map_err(|e| format!("cannot read identity file {identity_path}: {e}"))?;
     let wid: WorkloadId = serde_json::from_str(&data)
         .map_err(|e| format!("malformed identity file {identity_path}: {e}"))?;
     let opts = VerifyOptions::default();
-    let verified = verify_and_resolve(&wid, secret.as_bytes(), &opts)
+    let verified = verify_and_resolve_with_replay(&wid, secret.as_bytes(), &opts, replay_guard)
         .map_err(|e| format!("identity verification failed: {e}"))?;
     let principal = Principal::new(verified.principal_id, verified.label);
     Ok((principal, wid))
@@ -239,6 +240,7 @@ fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Err
 
 fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open(db_path)?;
+    let mut replay_guard = store.replay_guard()?;
 
     match action {
         GrantAction::Request {
@@ -248,7 +250,9 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             target,
             duration,
         } => {
-            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            // Replay guard on grant request: same identity assertion
+            // cannot request two grants. Fresh identity per request.
+            let (principal, _wid) = resolve_identity(&identity, &secret, Some(&mut replay_guard))?;
 
             let req = GrantRequest {
                 subject: principal.clone(),
@@ -333,7 +337,7 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             identity,
             secret,
         } => {
-            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
             let actor_ctx = ActorContext::subject(principal);
             let result = store.transition(
                 &id,
@@ -352,7 +356,7 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             secret,
             evidence,
         } => {
-            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
             let actor_ctx = ActorContext::subject(principal);
             let evidence: serde_json::Value = serde_json::from_str(&evidence)?;
             let result = store.transition(
@@ -373,7 +377,7 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             admin,
             reason,
         } => {
-            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
             let actor_ctx = if admin {
                 ActorContext::admin(principal)
             } else {

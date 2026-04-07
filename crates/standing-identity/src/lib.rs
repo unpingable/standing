@@ -67,6 +67,8 @@ pub enum AssessmentResult {
     AudienceMismatch,
     /// Identity is not yet valid (issued_at in the future beyond skew)
     NotYetValid,
+    /// This jti has already been presented within its validity window
+    ReplayDetected,
     /// Cannot safely determine standing (e.g., clock uncertainty)
     AssessmentCompromised,
 }
@@ -189,21 +191,59 @@ pub fn verify_identity(
 }
 
 /// Verify and resolve: fail-closed wrapper that returns VerifiedIdentity or error.
+///
+/// If a `replay_guard` is provided, the jti is checked for replay.
+/// If None, replay detection is skipped (caller's responsibility).
 pub fn verify_and_resolve(
     id: &WorkloadId,
     secret: &[u8],
     opts: &VerifyOptions,
 ) -> Result<VerifiedIdentity, IdentityError> {
+    verify_and_resolve_with_replay(id, secret, opts, None)
+}
+
+/// Verify and resolve with explicit replay guard.
+pub fn verify_and_resolve_with_replay(
+    id: &WorkloadId,
+    secret: &[u8],
+    opts: &VerifyOptions,
+    replay_guard: Option<&mut dyn ReplayGuard>,
+) -> Result<VerifiedIdentity, IdentityError> {
     let result = verify_identity(id, secret, opts);
     match result {
-        AssessmentResult::Valid => Ok(VerifiedIdentity {
-            principal_id: id.principal_id(),
-            label: id.name.clone(),
-            jti: id.jti.clone(),
-            issuer_time: id.issued_at,
-            verifier_time: opts.now.unwrap_or_else(Utc::now),
-            audience: id.audience.clone(),
-        }),
+        AssessmentResult::Valid => {
+            // Replay check (after all other checks pass)
+            if let Some(guard) = replay_guard {
+                match guard.check_and_record(&id.jti, &id.audience, id.expires_at) {
+                    Ok(true) => {} // New jti, proceed
+                    Ok(false) => {
+                        return Err(IdentityError::Assessment {
+                            result: AssessmentResult::ReplayDetected,
+                            detail: format!(
+                                "jti {} already presented for audience {}",
+                                id.jti, id.audience
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        // Storage failure → assessment compromised
+                        return Err(IdentityError::Assessment {
+                            result: AssessmentResult::AssessmentCompromised,
+                            detail: format!("replay guard error: {e}"),
+                        });
+                    }
+                }
+            }
+
+            Ok(VerifiedIdentity {
+                principal_id: id.principal_id(),
+                label: id.name.clone(),
+                jti: id.jti.clone(),
+                issuer_time: id.issued_at,
+                verifier_time: opts.now.unwrap_or_else(Utc::now),
+                audience: id.audience.clone(),
+            })
+        }
         _ => Err(IdentityError::Assessment {
             detail: format!(
                 "workload {} (aud: {}, exp: {})",
@@ -223,6 +263,29 @@ pub struct VerifiedIdentity {
     pub issuer_time: DateTime<Utc>,
     pub verifier_time: DateTime<Utc>,
     pub audience: String,
+}
+
+/// Replay guard: tracks seen jti values to detect duplicate presentations.
+///
+/// Implementors should:
+/// - Store (jti, audience) pairs with their expiry time
+/// - Return true from `check_and_record` if the jti is new (not seen before)
+/// - Return false if the jti has already been seen within its validity window
+/// - Periodically purge entries past their expiry + skew
+pub trait ReplayGuard {
+    /// Check if this jti+audience pair has been seen before.
+    /// If new, record it and return Ok(true).
+    /// If already seen, return Ok(false).
+    /// Errors are storage failures.
+    fn check_and_record(
+        &mut self,
+        jti: &str,
+        audience: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, String>;
+
+    /// Purge expired entries. Call periodically.
+    fn purge_expired(&mut self) -> Result<u64, String>;
 }
 
 fn sign(

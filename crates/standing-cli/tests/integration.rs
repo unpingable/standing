@@ -328,3 +328,54 @@ fn list_grants_shows_entries() {
     assert!(stdout.contains("deploy"));
     assert!(stdout.contains("wl:bot:host"));
 }
+
+// ---------------------------------------------------------------
+// Replay detection on grant request
+// ---------------------------------------------------------------
+
+#[test]
+fn replay_same_identity_on_grant_request_rejected() {
+    let db = temp_db();
+    let db_path = db.path().to_str().unwrap();
+    let id_file = temp_identity("bot", "host", SECRET);
+    let id_path = id_file.path().to_str().unwrap();
+
+    // First request succeeds
+    let (ok, stdout, _) = run(standing()
+        .args(["--db", db_path, "grant", "request",
+               "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    assert!(ok);
+    assert!(stdout.contains("granted"));
+
+    // Second request with SAME identity file (same jti) should be rejected
+    let (ok, _, stderr) = run(standing()
+        .args(["--db", db_path, "grant", "request",
+               "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "staging", "--duration", "300"]));
+    assert!(!ok);
+    assert!(stderr.contains("ReplayDetected") || stderr.contains("replay"));
+}
+
+#[test]
+fn fresh_identity_after_replay_works() {
+    let db = temp_db();
+    let db_path = db.path().to_str().unwrap();
+    let id1 = temp_identity("bot", "host", SECRET);
+    let id2 = temp_identity("bot", "host", SECRET);
+
+    // First request with id1
+    let (ok, _, _) = run(standing()
+        .args(["--db", db_path, "grant", "request",
+               "--identity", id1.path().to_str().unwrap(), "--secret", SECRET,
+               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    assert!(ok);
+
+    // Second request with id2 (different jti) succeeds
+    let (ok, stdout, _) = run(standing()
+        .args(["--db", db_path, "grant", "request",
+               "--identity", id2.path().to_str().unwrap(), "--secret", SECRET,
+               "--action", "deploy", "--target", "staging", "--duration", "300"]));
+    assert!(ok);
+    assert!(stdout.contains("granted"));
+}
