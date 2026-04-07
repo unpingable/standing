@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use standing_grant::{ActorContext, GrantMachine, GrantRequest, GrantScope, Principal};
+use standing_identity::{WorkloadId, verify_and_resolve};
 use standing_policy::{HardcodedPolicy, PolicyEvaluator, Verdict};
 use standing_store::{GrantMeta, Store};
 
@@ -16,6 +17,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create and manage workload identities
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
     /// Request, use, and manage grants
     Grant {
         #[command(subcommand)]
@@ -29,12 +35,40 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum IdentityAction {
+    /// Create a signed workload identity (writes JSON to stdout)
+    Create {
+        /// Workload name (e.g., "deploy-bot")
+        #[arg(long)]
+        name: String,
+        /// Workload location (e.g., "host-abc")
+        #[arg(long)]
+        location: String,
+        /// Shared secret for HMAC signing
+        #[arg(long)]
+        secret: String,
+    },
+    /// Verify an existing identity file
+    Verify {
+        /// Path to identity JSON file
+        #[arg(long)]
+        identity: String,
+        /// Shared secret for HMAC verification
+        #[arg(long)]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum GrantAction {
     /// Request a new grant, evaluate policy, and issue/deny it
     Request {
-        /// Actor requesting the grant (e.g., "deploy-bot")
+        /// Path to signed identity JSON file
         #[arg(long)]
-        actor: String,
+        identity: String,
+        /// Shared secret for identity verification
+        #[arg(long)]
+        secret: String,
         /// Action to perform (e.g., "deploy")
         #[arg(long)]
         action: String,
@@ -50,24 +84,51 @@ enum GrantAction {
         /// Grant ID
         #[arg(long)]
         id: String,
+        /// Path to signed identity JSON file
+        #[arg(long)]
+        identity: String,
+        /// Shared secret for identity verification
+        #[arg(long)]
+        secret: String,
     },
     /// Record use of an active grant
     Use {
         /// Grant ID
         #[arg(long)]
         id: String,
+        /// Path to signed identity JSON file
+        #[arg(long)]
+        identity: String,
+        /// Shared secret for identity verification
+        #[arg(long)]
+        secret: String,
         /// Evidence of what was done (JSON string)
         #[arg(long, default_value = "{}")]
         evidence: String,
     },
-    /// Revoke a grant
+    /// Revoke a grant (subject self-revoke or admin revoke)
     Revoke {
         /// Grant ID
         #[arg(long)]
         id: String,
+        /// Path to signed identity JSON file
+        #[arg(long)]
+        identity: String,
+        /// Shared secret for identity verification
+        #[arg(long)]
+        secret: String,
+        /// Revoke as admin (default: revoke as subject)
+        #[arg(long, default_value = "false")]
+        admin: bool,
         /// Reason for revocation
         #[arg(long)]
         reason: String,
+    },
+    /// Sweep expired grants (system actor)
+    Sweep {
+        /// Dry run: show what would be expired without doing it
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List grants
     List {
@@ -97,6 +158,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Commands::Identity { action } => handle_identity(action),
         Commands::Grant { action } => handle_grant(&cli.db, action),
         Commands::Query { action } => handle_query(&cli.db, action),
     };
@@ -107,18 +169,55 @@ fn main() {
     }
 }
 
+/// Load and verify a workload identity from a JSON file.
+/// Fail-closed: any error is fatal.
+fn resolve_identity(
+    identity_path: &str,
+    secret: &str,
+) -> Result<(Principal, WorkloadId), Box<dyn std::error::Error>> {
+    let data = std::fs::read_to_string(identity_path)
+        .map_err(|e| format!("cannot read identity file {identity_path}: {e}"))?;
+    let wid: WorkloadId = serde_json::from_str(&data)
+        .map_err(|e| format!("malformed identity file {identity_path}: {e}"))?;
+    let verified = verify_and_resolve(&wid, secret.as_bytes())
+        .map_err(|e| format!("identity verification failed: {e}"))?;
+    let principal = Principal::new(verified.principal_id, verified.label);
+    Ok((principal, wid))
+}
+
+fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        IdentityAction::Create {
+            name,
+            location,
+            secret,
+        } => {
+            let id = standing_identity::create_identity(&name, &location, secret.as_bytes())?;
+            let json = serde_json::to_string_pretty(&id)?;
+            println!("{json}");
+        }
+        IdentityAction::Verify { identity, secret } => {
+            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            println!("verified: {}", principal.id);
+            println!("  label: {}", principal.label);
+        }
+    }
+    Ok(())
+}
+
 fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open(db_path)?;
 
     match action {
         GrantAction::Request {
-            actor,
+            identity,
+            secret,
             action,
             target,
             duration,
         } => {
-            // CLI resolves identity at the boundary, passes canonical Principal
-            let principal = Principal::new(&actor, &actor);
+            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+
             let req = GrantRequest {
                 subject: principal.clone(),
                 scope: GrantScope {
@@ -129,11 +228,9 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                 context: serde_json::json!({}),
             };
 
-            // Step 1: Create the grant request (emits GrantRequested receipt)
             let mut machine = GrantMachine::request(&req)?;
             let grant_id = machine.grant_id();
 
-            // Record the request
             let requested_receipt = machine.chain.tip().clone();
             store.record_transition(
                 grant_id,
@@ -149,19 +246,12 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                 }),
             )?;
 
-            // Step 2: Evaluate policy (emits PolicyDecision receipt)
             let policy = HardcodedPolicy;
-            let decision = policy.evaluate(&req, &grant_id.to_string(), &requested_receipt.digest)?;
+            let decision =
+                policy.evaluate(&req, &grant_id.to_string(), &requested_receipt.digest)?;
 
-            // Store the policy decision receipt
-            store.record_transition(
-                grant_id,
-                &machine.state,
-                &decision.receipt,
-                None,
-            )?;
+            store.record_transition(grant_id, &machine.state, &decision.receipt, None)?;
 
-            // Step 3: Issue or deny based on policy
             match decision.verdict {
                 Verdict::Allow => {
                     machine.issue(
@@ -188,6 +278,7 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                         }),
                     )?;
                     println!("granted {grant_id}");
+                    println!("  subject: {}", req.subject.id);
                     println!("  expires: {}", expires_at.to_rfc3339());
                     println!("  receipt: {}", issue_receipt.digest);
                 }
@@ -205,12 +296,13 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                 }
             }
         }
-        GrantAction::Activate { id } => {
-            let grant = store.get_grant(&id)?
-                .ok_or_else(|| format!("grant not found: {id}"))?;
-            let actor_ctx = ActorContext::subject(
-                Principal::new(&grant.subject_id, &grant.actor),
-            );
+        GrantAction::Activate {
+            id,
+            identity,
+            secret,
+        } => {
+            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            let actor_ctx = ActorContext::subject(principal);
             let result = store.transition(
                 &id,
                 standing_grant::GrantState::Active,
@@ -222,12 +314,14 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             println!("activated {id}");
             println!("  receipt: {}", result.receipt_digest);
         }
-        GrantAction::Use { id, evidence } => {
-            let grant = store.get_grant(&id)?
-                .ok_or_else(|| format!("grant not found: {id}"))?;
-            let actor_ctx = ActorContext::subject(
-                Principal::new(&grant.subject_id, &grant.actor),
-            );
+        GrantAction::Use {
+            id,
+            identity,
+            secret,
+            evidence,
+        } => {
+            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            let actor_ctx = ActorContext::subject(principal);
             let evidence: serde_json::Value = serde_json::from_str(&evidence)?;
             let result = store.transition(
                 &id,
@@ -240,14 +334,19 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             println!("used {id}");
             println!("  receipt: {}", result.receipt_digest);
         }
-        GrantAction::Revoke { id, reason } => {
-            let grant = store.get_grant(&id)?
-                .ok_or_else(|| format!("grant not found: {id}"))?;
-            // For CLI revoke, treat as admin action (proper auth would
-            // come from identity resolution at the boundary)
-            let actor_ctx = ActorContext::admin(
-                Principal::new(&grant.subject_id, &grant.actor),
-            );
+        GrantAction::Revoke {
+            id,
+            identity,
+            secret,
+            admin,
+            reason,
+        } => {
+            let (principal, _wid) = resolve_identity(&identity, &secret)?;
+            let actor_ctx = if admin {
+                ActorContext::admin(principal)
+            } else {
+                ActorContext::subject(principal)
+            };
             let result = store.transition(
                 &id,
                 standing_grant::GrantState::Revoked,
@@ -260,6 +359,56 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             println!("  reason: {reason}");
             println!("  receipt: {}", result.receipt_digest);
         }
+        GrantAction::Sweep { dry_run } => {
+            let system_ctx = ActorContext::system();
+            let grants = store.list_grants(None)?;
+            let now = chrono::Utc::now();
+            let mut expired_count = 0;
+
+            for g in &grants {
+                // Only sweep non-terminal grants with an expiry in the past
+                if g.state == "issued" || g.state == "active" {
+                    if let Some(ref exp_str) = g.expires_at {
+                        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp_str) {
+                            if now >= exp.to_utc() {
+                                if dry_run {
+                                    println!(
+                                        "would expire: {} {} {} → {} (expired {})",
+                                        g.id, g.actor, g.action, g.target, exp_str
+                                    );
+                                } else {
+                                    match store.transition(
+                                        &g.id,
+                                        standing_grant::GrantState::Expired,
+                                        standing_receipt::ReceiptKind::GrantExpired,
+                                        &system_ctx,
+                                        serde_json::json!({"swept_at": now.to_rfc3339()}),
+                                        None,
+                                    ) {
+                                        Ok(r) => {
+                                            println!("expired {} (receipt: {})", g.id, r.receipt_digest);
+                                        }
+                                        Err(e) => {
+                                            // CAS conflict or already transitioned — tolerate
+                                            eprintln!("skip {}: {e}", g.id);
+                                        }
+                                    }
+                                }
+                                expired_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if expired_count == 0 {
+                println!("no expired grants found");
+            } else if dry_run {
+                println!("\n{expired_count} grant(s) would be expired");
+            } else {
+                println!("\n{expired_count} grant(s) swept");
+            }
+        }
         GrantAction::List { state } => {
             let grants = store.list_grants(state.as_deref())?;
             if grants.is_empty() {
@@ -268,8 +417,8 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             }
             for g in &grants {
                 println!(
-                    "{} {} {} → {} [{}]",
-                    g.id, g.actor, g.action, g.target, g.state
+                    "{} [{}] {} {} → {} (subject: {})",
+                    g.id, g.state, g.actor, g.action, g.target, g.subject_id
                 );
                 if let Some(ref exp) = g.expires_at {
                     println!("  expires: {exp}");
@@ -302,7 +451,6 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                 if let Some(ref ph) = r.policy_hash {
                     println!("      policy: {ph}");
                 }
-                // Parse and pretty-print evidence
                 if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence) {
                     if !ev.is_null() {
                         println!(
@@ -323,7 +471,6 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                 return Ok(());
             }
 
-            // Find the policy decision and the grant issued/denied receipts
             println!("why was grant {id} allowed/denied?\n");
             for r in &chain {
                 match r.kind.as_str() {

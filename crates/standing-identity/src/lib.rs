@@ -52,6 +52,19 @@ pub fn create_identity(
     })
 }
 
+impl WorkloadId {
+    /// Stable opaque principal ID derived from this identity.
+    /// Format: "wl:{name}:{location}"
+    pub fn principal_id(&self) -> String {
+        format!("wl:{}:{}", self.name, self.location)
+    }
+
+    /// Human-readable display label.
+    pub fn label(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Verify a workload identity's signature.
 pub fn verify_identity(id: &WorkloadId, secret: &[u8]) -> Result<(), IdentityError> {
     let expected = sign(&id.name, &id.location, &id.created_at, secret)?;
@@ -59,6 +72,24 @@ pub fn verify_identity(id: &WorkloadId, secret: &[u8]) -> Result<(), IdentityErr
         return Err(IdentityError::InvalidSignature(id.name.clone()));
     }
     Ok(())
+}
+
+/// Verify a workload identity and return it if valid.
+/// Fail-closed: any verification failure is an error.
+pub fn verify_and_resolve(id: &WorkloadId, secret: &[u8]) -> Result<VerifiedIdentity, IdentityError> {
+    verify_identity(id, secret)?;
+    Ok(VerifiedIdentity {
+        principal_id: id.principal_id(),
+        label: id.name.clone(),
+    })
+}
+
+/// A verified identity — the output of successful verification.
+/// Use this to construct a Principal in the grant domain.
+#[derive(Debug, Clone)]
+pub struct VerifiedIdentity {
+    pub principal_id: String,
+    pub label: String,
 }
 
 fn sign(
