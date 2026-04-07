@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Transaction};
 use uuid::Uuid;
 
-use standing_grant::GrantState;
+use standing_grant::{ActorContext, GrantState, PrincipalRole, auth};
 use standing_receipt::{Receipt, ReceiptBuilder, ReceiptKind};
 
 /// Errors from the store.
@@ -37,6 +37,13 @@ pub enum StoreError {
 
     #[error("grant expired at {0}")]
     GrantExpired(String),
+
+    #[error("unauthorized: actor {actor} (role: {role}) cannot perform {transition}")]
+    Unauthorized {
+        actor: String,
+        role: String,
+        transition: String,
+    },
 }
 
 /// The standing store.
@@ -83,6 +90,7 @@ impl Store {
 
             CREATE TABLE IF NOT EXISTS grants (
                 id TEXT PRIMARY KEY,
+                subject_id TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 action TEXT NOT NULL,
                 target TEXT NOT NULL,
@@ -94,6 +102,7 @@ impl Store {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE INDEX IF NOT EXISTS idx_grants_subject_id ON grants(subject_id);
             CREATE INDEX IF NOT EXISTS idx_grants_actor ON grants(actor);
             CREATE INDEX IF NOT EXISTS idx_grants_state ON grants(state);
             ",
@@ -130,16 +139,17 @@ impl Store {
 
         if let Some(meta) = grant_meta {
             tx.execute(
-                "INSERT INTO grants (id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
+                "INSERT INTO grants (id, subject_id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
                  ON CONFLICT(id) DO UPDATE SET
-                    state = ?5,
-                    issued_at = COALESCE(?6, grants.issued_at),
-                    expires_at = COALESCE(?7, grants.expires_at),
-                    latest_receipt_digest = ?8,
+                    state = ?6,
+                    issued_at = COALESCE(?7, grants.issued_at),
+                    expires_at = COALESCE(?8, grants.expires_at),
+                    latest_receipt_digest = ?9,
                     updated_at = datetime('now')",
                 params![
                     grant_id.to_string(),
+                    meta.subject_id,
                     meta.actor,
                     meta.action,
                     meta.target,
@@ -219,20 +229,9 @@ impl Store {
     /// Get the current state of a grant.
     pub fn get_grant(&self, grant_id: &str) -> Result<Option<GrantRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest FROM grants WHERE id = ?1",
+            "SELECT id, subject_id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest FROM grants WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![grant_id], |row| {
-            Ok(GrantRow {
-                id: row.get(0)?,
-                actor: row.get(1)?,
-                action: row.get(2)?,
-                target: row.get(3)?,
-                state: row.get(4)?,
-                issued_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                latest_receipt_digest: row.get(7)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![grant_id], map_grant_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -249,12 +248,25 @@ impl Store {
     /// 5. Commits receipt + state update atomically, conditional on head not having changed
     ///
     /// Returns the new receipt on success.
+    /// Checked, atomic state transition with CAS semantics.
+    ///
+    /// **This is the only legal mutation path for grant state.**
+    ///
+    /// It:
+    /// 1. Reads current grant state and head digest (inside transaction)
+    /// 2. Validates adjacency (pure graph via GrantState)
+    /// 3. Validates authorization (actor role vs auth matrix)
+    /// 4. Applies contextual guards (expiry, subject binding)
+    /// 5. Builds a receipt with both subject and actor identity
+    /// 6. Commits atomically with CAS on head digest
+    ///
+    /// Returns the new receipt on success.
     pub fn transition(
         &mut self,
         grant_id: &str,
         target_state: GrantState,
         receipt_kind: ReceiptKind,
-        actor: &str,
+        actor_ctx: &ActorContext,
         evidence: serde_json::Value,
         policy_hash: Option<&str>,
     ) -> Result<TransitionResult, StoreError> {
@@ -263,13 +275,14 @@ impl Store {
         // Step 1: Read current state (inside transaction for isolation)
         let grant = {
             let mut stmt = tx.prepare(
-                "SELECT state, latest_receipt_digest, expires_at FROM grants WHERE id = ?1",
+                "SELECT state, latest_receipt_digest, subject_id, expires_at FROM grants WHERE id = ?1",
             )?;
             let mut rows = stmt.query_map(params![grant_id], |row| {
                 Ok(GrantSnapshot {
                     state: row.get::<_, String>(0)?,
                     head_digest: row.get::<_, String>(1)?,
-                    expires_at: row.get::<_, Option<String>>(2)?,
+                    subject_id: row.get::<_, String>(2)?,
+                    expires_at: row.get::<_, Option<String>>(3)?,
                 })
             })?;
             match rows.next() {
@@ -293,7 +306,28 @@ impl Store {
             });
         }
 
-        // Step 3: Contextual guards
+        // Step 3: Validate authorization
+        if !auth::is_authorized(&current_state, &target_state, actor_ctx.role) {
+            return Err(StoreError::Unauthorized {
+                actor: actor_ctx.principal.id.clone(),
+                role: format!("{:?}", actor_ctx.role),
+                transition: format!("{} → {}", current_state, target_state),
+            });
+        }
+
+        // Step 3b: Subject binding — if acting as Subject, principal must
+        // match the grant's bound subject_id
+        if actor_ctx.role == PrincipalRole::Subject
+            && actor_ctx.principal.id != grant.subject_id
+        {
+            return Err(StoreError::Unauthorized {
+                actor: actor_ctx.principal.id.clone(),
+                role: "subject (wrong principal)".to_string(),
+                transition: format!("{} → {}", current_state, target_state),
+            });
+        }
+
+        // Step 4: Contextual guards
         // Expiry check: if grant has an expires_at and it's in the past,
         // the only valid transition is to Expired (not Used, not Active)
         if let Some(ref expires_at_str) = grant.expires_at {
@@ -304,20 +338,26 @@ impl Store {
             }
         }
 
-        // Step 4: Build receipt chained to current head
-        let mut builder =
-            ReceiptBuilder::new(receipt_kind, actor, grant_id).parent_digest(&grant.head_digest);
+        // Step 5: Build receipt with actor identity
+        let mut builder = ReceiptBuilder::new(receipt_kind, &actor_ctx.principal.id, grant_id)
+            .parent_digest(&grant.head_digest)
+            .evidence(serde_json::json!({
+                "actor": {
+                    "principal_id": actor_ctx.principal.id,
+                    "label": actor_ctx.principal.label,
+                    "role": actor_ctx.role,
+                },
+                "subject_id": grant.subject_id,
+                "detail": evidence,
+            }));
 
-        if !evidence.is_null() {
-            builder = builder.evidence(evidence);
-        }
         if let Some(ph) = policy_hash {
             builder = builder.policy_hash(ph);
         }
 
         let receipt = builder.build()?;
 
-        // Step 5: Atomic write with CAS — only update if head hasn't changed
+        // Step 6: Atomic write with CAS — only update if head hasn't changed
         insert_receipt(&tx, &receipt)?;
 
         let target_state_str = serde_json::to_value(&target_state)?
@@ -351,36 +391,23 @@ impl Store {
 
     /// List grants, optionally filtered by state.
     pub fn list_grants(&self, state_filter: Option<&str>) -> Result<Vec<GrantRow>, StoreError> {
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<GrantRow> {
-            Ok(GrantRow {
-                id: row.get(0)?,
-                actor: row.get(1)?,
-                action: row.get(2)?,
-                target: row.get(3)?,
-                state: row.get(4)?,
-                issued_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                latest_receipt_digest: row.get(7)?,
-            })
-        };
-
         let mut result = Vec::new();
 
         match state_filter {
             Some(state) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest FROM grants WHERE state = ?1 ORDER BY updated_at DESC",
+                    "SELECT id, subject_id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest FROM grants WHERE state = ?1 ORDER BY updated_at DESC",
                 )?;
-                let rows = stmt.query_map(params![state], map_row)?;
+                let rows = stmt.query_map(params![state], map_grant_row)?;
                 for row in rows {
                     result.push(row?);
                 }
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest FROM grants ORDER BY updated_at DESC",
+                    "SELECT id, subject_id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest FROM grants ORDER BY updated_at DESC",
                 )?;
-                let rows = stmt.query_map([], map_row)?;
+                let rows = stmt.query_map([], map_grant_row)?;
                 for row in rows {
                     result.push(row?);
                 }
@@ -389,6 +416,20 @@ impl Store {
 
         Ok(result)
     }
+}
+
+fn map_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
+    Ok(GrantRow {
+        id: row.get(0)?,
+        subject_id: row.get(1)?,
+        actor: row.get(2)?,
+        action: row.get(3)?,
+        target: row.get(4)?,
+        state: row.get(5)?,
+        issued_at: row.get(6)?,
+        expires_at: row.get(7)?,
+        latest_receipt_digest: row.get(8)?,
+    })
 }
 
 fn insert_receipt(tx: &Transaction, receipt: &Receipt) -> Result<(), StoreError> {
@@ -417,6 +458,9 @@ fn insert_receipt(tx: &Transaction, receipt: &Receipt) -> Result<(), StoreError>
 
 /// Metadata for creating/updating a grant row.
 pub struct GrantMeta {
+    /// Stable principal ID the grant is bound to
+    pub subject_id: String,
+    /// Display label for the actor (human-readable)
     pub actor: String,
     pub action: String,
     pub target: String,
@@ -442,6 +486,7 @@ pub struct ReceiptRow {
 #[derive(Debug)]
 pub struct GrantRow {
     pub id: String,
+    pub subject_id: String,
     pub actor: String,
     pub action: String,
     pub target: String,
@@ -455,6 +500,7 @@ pub struct GrantRow {
 struct GrantSnapshot {
     state: String,
     head_digest: String,
+    subject_id: String,
     expires_at: Option<String>,
 }
 
@@ -471,36 +517,59 @@ pub struct TransitionResult {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use standing_grant::Principal;
     use standing_receipt::{ReceiptBuilder, ReceiptKind};
 
-    /// Set up a grant in "issued" state with a given expiry, returning (store, grant_id_str).
+    const SUBJECT_ID: &str = "wl:deploy-bot:host-abc";
+
+    fn bot_subject() -> ActorContext {
+        ActorContext::subject(Principal::new(SUBJECT_ID, "deploy-bot"))
+    }
+
+    fn admin_ctx() -> ActorContext {
+        ActorContext::admin(Principal::new("admin:jbeck", "jbeck"))
+    }
+
+    fn wrong_subject() -> ActorContext {
+        ActorContext::subject(Principal::new("wl:evil-bot:host-xyz", "evil-bot"))
+    }
+
+    fn meta() -> GrantMeta {
+        GrantMeta {
+            subject_id: SUBJECT_ID.to_string(),
+            actor: "deploy-bot".to_string(),
+            action: "deploy".to_string(),
+            target: "prod".to_string(),
+            issued_at: None,
+            expires_at: None,
+        }
+    }
+
+    fn meta_with_expiry(expires_at: DateTime<Utc>) -> GrantMeta {
+        GrantMeta {
+            subject_id: SUBJECT_ID.to_string(),
+            actor: "deploy-bot".to_string(),
+            action: "deploy".to_string(),
+            target: "prod".to_string(),
+            issued_at: Some(Utc::now()),
+            expires_at: Some(expires_at),
+        }
+    }
+
+    /// Set up a grant in "issued" state with a given expiry.
     fn setup_issued_grant(expires_at: DateTime<Utc>) -> (Store, String) {
         let mut store = Store::in_memory().unwrap();
         let grant_id = Uuid::new_v4();
         let id_str = grant_id.to_string();
-        let now = Utc::now();
 
-        // Requested receipt
-        let r1 = ReceiptBuilder::new(ReceiptKind::GrantRequested, "bot", &id_str)
+        let r1 = ReceiptBuilder::new(ReceiptKind::GrantRequested, SUBJECT_ID, &id_str)
             .build()
             .unwrap();
         store
-            .record_transition(
-                grant_id,
-                &GrantState::Requested,
-                &r1,
-                Some(GrantMeta {
-                    actor: "bot".to_string(),
-                    action: "deploy".to_string(),
-                    target: "prod".to_string(),
-                    issued_at: None,
-                    expires_at: None,
-                }),
-            )
+            .record_transition(grant_id, &GrantState::Requested, &r1, Some(meta()))
             .unwrap();
 
-        // Issued receipt
-        let r2 = ReceiptBuilder::new(ReceiptKind::GrantIssued, "bot", &id_str)
+        let r2 = ReceiptBuilder::new(ReceiptKind::GrantIssued, SUBJECT_ID, &id_str)
             .parent_digest(&r1.digest)
             .build()
             .unwrap();
@@ -509,28 +578,19 @@ mod tests {
                 grant_id,
                 &GrantState::Issued,
                 &r2,
-                Some(GrantMeta {
-                    actor: "bot".to_string(),
-                    action: "deploy".to_string(),
-                    target: "prod".to_string(),
-                    issued_at: Some(now),
-                    expires_at: Some(expires_at),
-                }),
+                Some(meta_with_expiry(expires_at)),
             )
             .unwrap();
 
         (store, id_str)
     }
 
-    /// Set up a grant in "active" state with a given expiry.
-    /// Uses record_transition (bypass) so we can set up expired-but-active
-    /// grants for testing without the domain layer blocking us.
+    /// Set up a grant in "active" state (uses bypass for expired-but-active tests).
     fn setup_active_grant(expires_at: DateTime<Utc>) -> (Store, String) {
         let (mut store, id_str) = setup_issued_grant(expires_at);
 
-        // Get the current head to chain the receipt
         let grant = store.get_grant(&id_str).unwrap().unwrap();
-        let r = ReceiptBuilder::new(ReceiptKind::GrantActivated, "bot", &id_str)
+        let r = ReceiptBuilder::new(ReceiptKind::GrantActivated, SUBJECT_ID, &id_str)
             .parent_digest(&grant.latest_receipt_digest)
             .build()
             .unwrap();
@@ -543,27 +603,20 @@ mod tests {
         (store, id_str)
     }
 
+    // ---------------------------------------------------------------
+    // Basic store operations
+    // ---------------------------------------------------------------
+
     #[test]
     fn store_and_retrieve_receipt() {
         let mut store = Store::in_memory().unwrap();
-        let receipt = ReceiptBuilder::new(ReceiptKind::GrantRequested, "bot", "grant-1")
+        let receipt = ReceiptBuilder::new(ReceiptKind::GrantRequested, SUBJECT_ID, "grant-1")
             .build()
             .unwrap();
 
         let grant_id = Uuid::new_v4();
         store
-            .record_transition(
-                grant_id,
-                &GrantState::Requested,
-                &receipt,
-                Some(GrantMeta {
-                    actor: "bot".to_string(),
-                    action: "deploy".to_string(),
-                    target: "prod".to_string(),
-                    issued_at: None,
-                    expires_at: None,
-                }),
-            )
+            .record_transition(grant_id, &GrantState::Requested, &receipt, Some(meta()))
             .unwrap();
 
         let chain = store.receipt_chain(&receipt.subject).unwrap();
@@ -574,38 +627,22 @@ mod tests {
     #[test]
     fn list_grants_by_state() {
         let mut store = Store::in_memory().unwrap();
-        let receipt = ReceiptBuilder::new(ReceiptKind::GrantRequested, "bot", "g1")
+        let receipt = ReceiptBuilder::new(ReceiptKind::GrantRequested, SUBJECT_ID, "g1")
             .build()
             .unwrap();
 
         let grant_id = Uuid::new_v4();
         store
-            .record_transition(
-                grant_id,
-                &GrantState::Requested,
-                &receipt,
-                Some(GrantMeta {
-                    actor: "bot".to_string(),
-                    action: "deploy".to_string(),
-                    target: "prod".to_string(),
-                    issued_at: None,
-                    expires_at: None,
-                }),
-            )
+            .record_transition(grant_id, &GrantState::Requested, &receipt, Some(meta()))
             .unwrap();
 
-        let all = store.list_grants(None).unwrap();
-        assert_eq!(all.len(), 1);
-
-        let requested = store.list_grants(Some("requested")).unwrap();
-        assert_eq!(requested.len(), 1);
-
-        let issued = store.list_grants(Some("issued")).unwrap();
-        assert_eq!(issued.len(), 0);
+        assert_eq!(store.list_grants(None).unwrap().len(), 1);
+        assert_eq!(store.list_grants(Some("requested")).unwrap().len(), 1);
+        assert_eq!(store.list_grants(Some("issued")).unwrap().len(), 0);
     }
 
     // ---------------------------------------------------------------
-    // Domain-level transition tests
+    // Domain-level transition tests (happy path)
     // ---------------------------------------------------------------
 
     #[test]
@@ -613,34 +650,34 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        // issued → active
         let r = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap();
         assert_eq!(r.to_state, GrantState::Active);
 
-        // active → used
         let r = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed, "bot",
-            serde_json::json!({"deployed": "v1.0"}), None,
+            &id, GrantState::Used, ReceiptKind::GrantUsed,
+            &bot_subject(), serde_json::json!({"deployed": "v1.0"}), None,
         ).unwrap();
         assert_eq!(r.to_state, GrantState::Used);
 
-        // Verify chain integrity
         let chain = store.receipt_chain(&id).unwrap();
-        assert_eq!(chain.len(), 4); // requested, issued, activated, used
+        assert_eq!(chain.len(), 4);
     }
+
+    // ---------------------------------------------------------------
+    // Adjacency / terminal state
+    // ---------------------------------------------------------------
 
     #[test]
     fn rejects_invalid_adjacency() {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        // issued → used (skipping active) should fail
         let err = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Used, ReceiptKind::GrantUsed,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
@@ -650,16 +687,14 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_active_grant(future);
 
-        // active → used
         store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Used, ReceiptKind::GrantUsed,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap();
 
-        // used → active (terminal, no transitions allowed)
         let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
@@ -670,44 +705,36 @@ mod tests {
 
     #[test]
     fn expired_grant_cannot_be_activated() {
-        // Grant that expired 10 seconds ago
         let past = Utc::now() - Duration::seconds(10);
         let (mut store, id) = setup_issued_grant(past);
 
-        // Try to activate an expired grant — should fail
         let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::GrantExpired(_)));
     }
 
     #[test]
     fn expired_grant_cannot_be_used() {
-        // Grant that expires 1 second from now — activate it, then wait
-        // We can't actually sleep in tests, so we set up an active grant
-        // with an already-past expiry by using record_transition directly.
         let past = Utc::now() - Duration::seconds(10);
         let (mut store, id) = setup_active_grant(past);
 
-        // Try to use an expired active grant — should fail
         let err = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed, "bot",
-            serde_json::json!({"action": "deploy"}), None,
+            &id, GrantState::Used, ReceiptKind::GrantUsed,
+            &bot_subject(), serde_json::json!({"action": "deploy"}), None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::GrantExpired(_)));
     }
 
     #[test]
     fn expired_grant_can_be_marked_expired() {
-        // Even though the grant is expired, we should be able to
-        // transition it to the Expired terminal state
         let past = Utc::now() - Duration::seconds(10);
         let (mut store, id) = setup_issued_grant(past);
 
         let r = store.transition(
-            &id, GrantState::Expired, ReceiptKind::GrantExpired, "system",
-            serde_json::Value::Null, None,
+            &id, GrantState::Expired, ReceiptKind::GrantExpired,
+            &ActorContext::system(), serde_json::Value::Null, None,
         ).unwrap();
         assert_eq!(r.to_state, GrantState::Expired);
     }
@@ -721,16 +748,14 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        // Revoke it
         store.transition(
-            &id, GrantState::Revoked, ReceiptKind::GrantRevoked, "admin",
-            serde_json::json!({"reason": "security incident"}), None,
+            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
+            &admin_ctx(), serde_json::json!({"reason": "security incident"}), None,
         ).unwrap();
 
-        // Try to activate — should fail (revoked is terminal)
         let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
@@ -740,65 +765,49 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_active_grant(future);
 
-        // Revoke it while active
         store.transition(
-            &id, GrantState::Revoked, ReceiptKind::GrantRevoked, "admin",
-            serde_json::json!({"reason": "policy change"}), None,
+            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
+            &admin_ctx(), serde_json::json!({"reason": "policy change"}), None,
         ).unwrap();
 
-        // Try to use — should fail
         let err = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Used, ReceiptKind::GrantUsed,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
 
     // ---------------------------------------------------------------
-    // Failure mode: receipt-write-failure rollback
+    // Receipt-write-failure rollback
     // ---------------------------------------------------------------
 
     #[test]
-    fn duplicate_receipt_digest_rolls_back_transition() {
+    fn failed_transition_does_not_advance_state() {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        // Activate normally
         store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap();
 
-        // Verify we're active
-        let grant = store.get_grant(&id).unwrap().unwrap();
-        assert_eq!(grant.state, "active");
+        assert_eq!(store.get_grant(&id).unwrap().unwrap().state, "active");
 
-        // Now try a transition that would succeed on adjacency,
-        // but we'll verify that if the receipt INSERT fails (e.g., duplicate
-        // primary key), the state doesn't advance.
-        // We can't easily force a receipt collision, but we CAN verify that
-        // after a failed transition the state is unchanged.
+        // Invalid adjacency: active → issued
         let err = store.transition(
-            &id, GrantState::Issued, ReceiptKind::GrantIssued, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Issued, ReceiptKind::GrantIssued,
+            &bot_subject(), serde_json::Value::Null, None,
         );
         assert!(err.is_err());
-
-        // State must still be active
-        let grant = store.get_grant(&id).unwrap().unwrap();
-        assert_eq!(grant.state, "active");
+        assert_eq!(store.get_grant(&id).unwrap().unwrap().state, "active");
     }
 
     #[test]
     fn grant_not_found_returns_error() {
         let mut store = Store::in_memory().unwrap();
         let err = store.transition(
-            "nonexistent-id",
-            GrantState::Active,
-            ReceiptKind::GrantActivated,
-            "bot",
-            serde_json::Value::Null,
-            None,
+            "nonexistent-id", GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::GrantNotFound(_)));
     }
@@ -809,30 +818,23 @@ mod tests {
 
     #[test]
     fn stale_head_cas_conflict() {
-        // Simulate two concurrent transitions: one succeeds, the second
-        // finds the head has moved and fails cleanly.
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        // Read the head before any transition
-        let grant_before = store.get_grant(&id).unwrap().unwrap();
-        let stale_head = grant_before.latest_receipt_digest.clone();
+        let stale_head = store.get_grant(&id).unwrap().unwrap().latest_receipt_digest.clone();
 
-        // First transition succeeds: issued → active
         store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated, "bot",
-            serde_json::Value::Null, None,
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
         ).unwrap();
 
-        // Now manually try to write against the stale head.
-        // Build a receipt chained to the OLD head (as if we validated earlier).
-        let stale_receipt = ReceiptBuilder::new(ReceiptKind::GrantRevoked, "admin", &id)
+        // Manually attempt a write against the stale head
+        let stale_receipt = ReceiptBuilder::new(ReceiptKind::GrantRevoked, "admin:jbeck", &id)
             .parent_digest(&stale_head)
             .evidence(serde_json::json!({"reason": "stale attempt"}))
             .build()
             .unwrap();
 
-        // Try to commit with the stale head — the CAS UPDATE should match 0 rows
         let tx = store.conn.transaction().unwrap();
         insert_receipt(&tx, &stale_receipt).unwrap();
         let rows_updated = tx.execute(
@@ -840,13 +842,122 @@ mod tests {
              WHERE id = ?2 AND latest_receipt_digest = ?3",
             params![stale_receipt.digest, id, stale_head],
         ).unwrap();
-        // CAS fails: 0 rows updated because head has moved
         assert_eq!(rows_updated, 0);
-        // Don't commit — rollback
         tx.rollback().unwrap();
 
-        // State is still active, not revoked
-        let grant_after = store.get_grant(&id).unwrap().unwrap();
-        assert_eq!(grant_after.state, "active");
+        assert_eq!(store.get_grant(&id).unwrap().unwrap().state, "active");
+    }
+
+    // ---------------------------------------------------------------
+    // Identity authorization tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn wrong_principal_cannot_activate() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        let err = store.transition(
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &wrong_subject(), serde_json::Value::Null, None,
+        ).unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn wrong_principal_cannot_use() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_active_grant(future);
+
+        let err = store.transition(
+            &id, GrantState::Used, ReceiptKind::GrantUsed,
+            &wrong_subject(), serde_json::json!({"action": "steal"}), None,
+        ).unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn admin_can_revoke() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        let r = store.transition(
+            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
+            &admin_ctx(), serde_json::json!({"reason": "policy"}), None,
+        ).unwrap();
+        assert_eq!(r.to_state, GrantState::Revoked);
+    }
+
+    #[test]
+    fn subject_can_self_revoke() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        let r = store.transition(
+            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
+            &bot_subject(), serde_json::json!({"reason": "no longer needed"}), None,
+        ).unwrap();
+        assert_eq!(r.to_state, GrantState::Revoked);
+    }
+
+    #[test]
+    fn admin_cannot_activate() {
+        // Only subject can activate — admin role is not authorized
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        let err = store.transition(
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &admin_ctx(), serde_json::Value::Null, None,
+        ).unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn subject_cannot_expire_grant() {
+        // Only system can mark as expired
+        let past = Utc::now() - Duration::seconds(10);
+        let (mut store, id) = setup_issued_grant(past);
+
+        let err = store.transition(
+            &id, GrantState::Expired, ReceiptKind::GrantExpired,
+            &bot_subject(), serde_json::Value::Null, None,
+        ).unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn identity_mismatch_does_not_advance_state() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        let _ = store.transition(
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &wrong_subject(), serde_json::Value::Null, None,
+        );
+
+        // State must still be issued
+        assert_eq!(store.get_grant(&id).unwrap().unwrap().state, "issued");
+    }
+
+    #[test]
+    fn receipt_records_actor_and_subject() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        store.transition(
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
+        ).unwrap();
+
+        let chain = store.receipt_chain(&id).unwrap();
+        let activate_receipt = chain.last().unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_str(&activate_receipt.evidence).unwrap();
+
+        // Receipt should contain actor identity and subject binding
+        assert_eq!(evidence["actor"]["principal_id"], SUBJECT_ID);
+        assert_eq!(evidence["subject_id"], SUBJECT_ID);
+        assert_eq!(evidence["actor"]["role"], "subject");
     }
 }

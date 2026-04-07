@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use standing_grant::{GrantMachine, GrantRequest, GrantScope};
+use standing_grant::{ActorContext, GrantMachine, GrantRequest, GrantScope, Principal};
 use standing_policy::{HardcodedPolicy, PolicyEvaluator, Verdict};
 use standing_store::{GrantMeta, Store};
 
@@ -117,8 +117,10 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             target,
             duration,
         } => {
+            // CLI resolves identity at the boundary, passes canonical Principal
+            let principal = Principal::new(&actor, &actor);
             let req = GrantRequest {
-                actor: actor.clone(),
+                subject: principal.clone(),
                 scope: GrantScope {
                     action: action.clone(),
                     target: target.clone(),
@@ -138,7 +140,8 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                 &machine.state,
                 &requested_receipt,
                 Some(GrantMeta {
-                    actor: actor.clone(),
+                    subject_id: principal.id.clone(),
+                    actor: principal.label.clone(),
                     action: action.clone(),
                     target: target.clone(),
                     issued_at: None,
@@ -151,11 +154,9 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             let decision = policy.evaluate(&req, &grant_id.to_string(), &requested_receipt.digest)?;
 
             // Store the policy decision receipt
-            // Policy receipt uses actor as subject, but we need it findable by grant_id
-            // Store it separately — it's evidence, not a grant transition
             store.record_transition(
                 grant_id,
-                &machine.state, // state doesn't change from policy receipt alone
+                &machine.state,
                 &decision.receipt,
                 None,
             )?;
@@ -178,7 +179,8 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                         &state,
                         &issue_receipt,
                         Some(GrantMeta {
-                            actor,
+                            subject_id: principal.id,
+                            actor: principal.label,
                             action,
                             target,
                             issued_at: Some(issued_at),
@@ -206,11 +208,14 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
         GrantAction::Activate { id } => {
             let grant = store.get_grant(&id)?
                 .ok_or_else(|| format!("grant not found: {id}"))?;
+            let actor_ctx = ActorContext::subject(
+                Principal::new(&grant.subject_id, &grant.actor),
+            );
             let result = store.transition(
                 &id,
                 standing_grant::GrantState::Active,
                 standing_receipt::ReceiptKind::GrantActivated,
-                &grant.actor,
+                &actor_ctx,
                 serde_json::Value::Null,
                 None,
             )?;
@@ -220,12 +225,15 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
         GrantAction::Use { id, evidence } => {
             let grant = store.get_grant(&id)?
                 .ok_or_else(|| format!("grant not found: {id}"))?;
+            let actor_ctx = ActorContext::subject(
+                Principal::new(&grant.subject_id, &grant.actor),
+            );
             let evidence: serde_json::Value = serde_json::from_str(&evidence)?;
             let result = store.transition(
                 &id,
                 standing_grant::GrantState::Used,
                 standing_receipt::ReceiptKind::GrantUsed,
-                &grant.actor,
+                &actor_ctx,
                 evidence,
                 None,
             )?;
@@ -235,11 +243,16 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
         GrantAction::Revoke { id, reason } => {
             let grant = store.get_grant(&id)?
                 .ok_or_else(|| format!("grant not found: {id}"))?;
+            // For CLI revoke, treat as admin action (proper auth would
+            // come from identity resolution at the boundary)
+            let actor_ctx = ActorContext::admin(
+                Principal::new(&grant.subject_id, &grant.actor),
+            );
             let result = store.transition(
                 &id,
                 standing_grant::GrantState::Revoked,
                 standing_receipt::ReceiptKind::GrantRevoked,
-                &grant.actor,
+                &actor_ctx,
                 serde_json::json!({"reason": reason}),
                 None,
             )?;

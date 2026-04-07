@@ -114,8 +114,9 @@ impl GrantMachine {
         let grant_id = Uuid::new_v4();
         let subject = grant_id.to_string();
 
-        let receipt = ReceiptBuilder::new(ReceiptKind::GrantRequested, &req.actor, &subject)
+        let receipt = ReceiptBuilder::new(ReceiptKind::GrantRequested, &req.subject.id, &subject)
             .evidence(serde_json::json!({
+                "subject": req.subject,
                 "scope": {
                     "action": req.scope.action,
                     "target": req.scope.target,
@@ -148,7 +149,7 @@ impl GrantMachine {
         let now = Utc::now();
         let grant = Grant {
             id: self.grant_id,
-            actor: self.actor().to_string(),
+            subject: self.subject_from_chain(),
             scope: self.scope_from_chain(),
             issued_at: now,
             expires_at: now + Duration::seconds(duration_secs as i64),
@@ -156,7 +157,7 @@ impl GrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantIssued,
-            &grant.actor,
+            &grant.subject.id,
             &self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -181,7 +182,7 @@ impl GrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantDenied,
-            self.actor(),
+            self.subject_id(),
             &self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -202,7 +203,7 @@ impl GrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantActivated,
-            self.actor(),
+            self.subject_id(),
             &self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -221,7 +222,7 @@ impl GrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantUsed,
-            self.actor(),
+            self.subject_id(),
             &self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -245,7 +246,7 @@ impl GrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantExpired,
-            self.actor(),
+            self.subject_id(),
             &self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -268,7 +269,7 @@ impl GrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantRevoked,
-            self.actor(),
+            self.subject_id(),
             &self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -292,7 +293,7 @@ impl GrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantAbandoned,
-            self.actor(),
+            self.subject_id(),
             &self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -309,9 +310,23 @@ impl GrantMachine {
         self.grant_id
     }
 
-    fn actor(&self) -> &str {
-        // Actor is on the first receipt in the chain
+    fn subject_id(&self) -> &str {
+        // Subject principal ID is on the first receipt in the chain (as the actor field)
         &self.chain.receipts()[0].actor
+    }
+
+    fn subject_from_chain(&self) -> crate::principal::Principal {
+        let evidence = &self.chain.receipts()[0].evidence;
+        crate::principal::Principal {
+            id: evidence["subject"]["id"]
+                .as_str()
+                .unwrap_or(self.subject_id())
+                .to_string(),
+            label: evidence["subject"]["label"]
+                .as_str()
+                .unwrap_or(self.subject_id())
+                .to_string(),
+        }
     }
 
     fn scope_from_chain(&self) -> GrantScope {
@@ -359,9 +374,11 @@ mod tests {
     use super::*;
     use crate::grant::GrantRequest;
 
+    use crate::principal::Principal;
+
     fn test_request() -> GrantRequest {
         GrantRequest {
-            actor: "deploy-bot".to_string(),
+            subject: Principal::new("wl:deploy-bot:host-abc", "deploy-bot"),
             scope: GrantScope {
                 action: "deploy".to_string(),
                 target: "prod/web-api".to_string(),

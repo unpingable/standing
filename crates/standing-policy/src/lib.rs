@@ -69,8 +69,8 @@ impl PolicyEvaluator for HardcodedPolicy {
         let policy_hash = self.policy_hash();
 
         // Evaluate
-        let (verdict, reason) = if request.actor.is_empty() {
-            (Verdict::Deny, "actor is empty".to_string())
+        let (verdict, reason) = if request.subject.id.is_empty() {
+            (Verdict::Deny, "subject identity is empty".to_string())
         } else if request.scope.action.is_empty() {
             (Verdict::Deny, "action is empty".to_string())
         } else if request.scope.target.is_empty() {
@@ -99,7 +99,7 @@ impl PolicyEvaluator for HardcodedPolicy {
                 "verdict": verdict,
                 "reason": reason,
                 "request": {
-                    "actor": request.actor,
+                    "subject": request.subject,
                     "action": request.scope.action,
                     "target": request.scope.target,
                     "duration_secs": request.duration_secs,
@@ -124,11 +124,11 @@ impl PolicyEvaluator for HardcodedPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use standing_grant::{GrantRequest, GrantScope};
+    use standing_grant::{GrantRequest, GrantScope, Principal};
 
-    fn make_request(actor: &str, action: &str, target: &str, duration: u64) -> GrantRequest {
+    fn make_request(subject_id: &str, action: &str, target: &str, duration: u64) -> GrantRequest {
         GrantRequest {
-            actor: actor.to_string(),
+            subject: Principal::new(subject_id, subject_id),
             scope: GrantScope {
                 action: action.to_string(),
                 target: target.to_string(),
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn denies_empty_actor() {
+    fn denies_empty_subject() {
         let policy = HardcodedPolicy;
         let req = make_request("", "deploy", "prod", 300);
         let decision = policy.evaluate(&req, "test-grant-id", &fake_parent()).unwrap();

@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// What the grant permits: actor × action × target.
+use crate::principal::Principal;
+
+/// What the grant permits: action × target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantScope {
     /// The action being permitted (e.g., "deploy", "rotate-secret", "scale")
@@ -14,8 +16,8 @@ pub struct GrantScope {
 /// A request to create a grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantRequest {
-    /// Who is requesting the grant
-    pub actor: String,
+    /// Who is requesting the grant (stable principal)
+    pub subject: Principal,
     /// What the grant would permit
     pub scope: GrantScope,
     /// Requested duration in seconds
@@ -29,8 +31,8 @@ pub struct GrantRequest {
 pub struct Grant {
     /// Unique grant ID
     pub id: Uuid,
-    /// Who holds this grant
-    pub actor: String,
+    /// The principal this grant is bound to (stable identity)
+    pub subject: Principal,
     /// What it permits
     pub scope: GrantScope,
     /// When the grant was issued
