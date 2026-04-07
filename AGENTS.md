@@ -12,7 +12,8 @@ If anything here conflicts with the user's explicit instructions, the user wins.
 ```bash
 cargo build
 cargo test
-cargo run -p standing-cli -- grant request --actor deploy-bot --action deploy --target prod/web-api
+cargo run -p standing-cli -- identity create --name deploy-bot --location host-abc --secret test-key > /tmp/bot.id.json
+cargo run -p standing-cli -- grant request --identity /tmp/bot.id.json --secret test-key --action deploy --target prod/web-api
 ```
 
 ## Tests
@@ -46,10 +47,10 @@ Always run tests before proposing commits. Never claim tests pass without runnin
 ```
 crates/
   standing-receipt/   Receipt kernel (content-addressed, canonical JSON + SHA-256)
-  standing-grant/     Grant lifecycle state machine
+  standing-grant/     Grant lifecycle, Principal/ActorContext, auth matrix
   standing-policy/    Policy evaluator (trait + hardcoded impl)
-  standing-identity/  HMAC-signed workload identity
-  standing-store/     SQLite storage, atomic transitions, query surface
+  standing-identity/  HMAC-signed workload identity, verification, principal resolution
+  standing-store/     SQLite storage, atomic CAS transitions, query surface
   standing-cli/       CLI binary ("standing")
 DESIGN.md             Architecture and design intent
 GOVERNOR-CROSSWALK.md Correspondence with Governor concepts

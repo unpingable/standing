@@ -24,20 +24,25 @@ Core question: "Was this actor entitled to do that, under what grant, with what 
 ```bash
 cargo build
 cargo test
+# Create a verified identity
+standing identity create --name deploy-bot --location host-abc --secret my-key > bot.id.json
 # End-to-end: request → activate → use → query
-standing grant request --actor deploy-bot --action deploy --target prod/web-api --duration 300
-standing grant activate --id <grant-id>
-standing grant use --id <grant-id> --evidence '{"deployed":"v1.2.3"}'
+standing grant request --identity bot.id.json --secret my-key --action deploy --target prod/web-api --duration 300
+standing grant activate --id <grant-id> --identity bot.id.json --secret my-key
+standing grant use --id <grant-id> --identity bot.id.json --secret my-key --evidence '{"deployed":"v1.2.3"}'
 standing query why --id <grant-id>
 standing query chain --id <grant-id>
+# Sweep expired grants
+standing grant sweep --dry-run
+standing grant sweep
 ```
 
 ## Project Structure
 
 - `crates/standing-receipt/` — Receipt kernel: content-addressed receipts, chains, canonical JSON
-- `crates/standing-grant/` — Grant lifecycle state machine with receipts at every transition
+- `crates/standing-grant/` — Grant lifecycle state machine, Principal/ActorContext, auth matrix
 - `crates/standing-policy/` — Policy evaluator trait + hardcoded policy (slice 1)
-- `crates/standing-identity/` — HMAC-signed workload identity (minimal)
+- `crates/standing-identity/` — HMAC-signed workload identity, verification, principal resolution
 - `crates/standing-store/` — SQLite storage with atomic receipt+state transitions
 - `crates/standing-cli/` — CLI driver (`standing` binary)
 
@@ -53,5 +58,6 @@ standing query chain --id <grant-id>
 
 - Don't collapse into agent governance or health monitoring
 - Don't let identity become the project (distinguish known from unknown is enough)
-- Don't add signatures before the receipt format is proven
+- Don't upgrade HMAC identity to full PKI without real need
 - Don't build a policy cathedral — hardcoded policy is fine until it isn't
+- Don't let CLI do identity resolution beyond the boundary — store receives canonical ActorContext

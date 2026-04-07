@@ -24,18 +24,26 @@ Modern infra is good at telling you whether a service is alive and much worse at
 cargo build
 cargo test
 
-# Request a grant (policy evaluates, issues or denies)
-standing grant request --actor deploy-bot --action deploy --target prod/web-api --duration 300
+# Create a verified workload identity
+standing identity create --name deploy-bot --location host-abc --secret my-key > bot.id.json
 
-# Activate and use it
-standing grant activate --id <grant-id>
-standing grant use --id <grant-id> --evidence '{"deployed":"v1.2.3"}'
+# Request a grant (identity verified, policy evaluates, issues or denies)
+standing grant request --identity bot.id.json --secret my-key \
+  --action deploy --target prod/web-api --duration 300
+
+# Activate and use it (identity verified at each step)
+standing grant activate --id <grant-id> --identity bot.id.json --secret my-key
+standing grant use --id <grant-id> --identity bot.id.json --secret my-key \
+  --evidence '{"deployed":"v1.2.3"}'
 
 # Query: why was this allowed?
 standing query why --id <grant-id>
 
 # Query: full receipt chain
 standing query chain --id <grant-id>
+
+# Sweep expired grants (system actor)
+standing grant sweep
 ```
 
 ## Architecture

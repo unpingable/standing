@@ -430,6 +430,30 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+fn print_actor_from_evidence(evidence_str: &str) {
+    if let Ok(ev) = serde_json::from_str::<serde_json::Value>(evidence_str) {
+        if let Some(actor) = ev.get("actor") {
+            if let Some(pid) = actor.get("principal_id") {
+                print!("    actor:  {pid}");
+                if let Some(role) = actor.get("role") {
+                    print!(" (role: {role})");
+                }
+                println!();
+            }
+            if let Some(label) = actor.get("label") {
+                if label.as_str() != actor.get("principal_id").and_then(|v| v.as_str()) {
+                    println!("    label:  {label}");
+                }
+            }
+        }
+        if let Some(detail) = ev.get("detail") {
+            if !detail.is_null() && detail != &serde_json::Value::Object(serde_json::Map::new()) {
+                println!("    detail: {detail}");
+            }
+        }
+    }
+}
+
 fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(db_path)?;
 
@@ -440,7 +464,7 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                 println!("no receipts for grant {id}");
                 return Ok(());
             }
-            println!("receipt chain for {id} ({} receipts):", chain.len());
+            println!("receipt chain for {id} ({} receipts):\n", chain.len());
             for (i, r) in chain.iter().enumerate() {
                 println!("  [{i}] {} {}", r.kind, r.digest);
                 println!("      actor: {}", r.actor);
@@ -453,18 +477,42 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                 }
                 if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence) {
                     if !ev.is_null() {
-                        println!(
-                            "      evidence: {}",
-                            serde_json::to_string_pretty(&ev)?
-                                .lines()
-                                .collect::<Vec<_>>()
-                                .join("\n               ")
-                        );
+                        // Show structured actor/subject if present
+                        if let Some(actor) = ev.get("actor") {
+                            if let Some(pid) = actor.get("principal_id") {
+                                print!("      principal: {pid}");
+                                if let Some(role) = actor.get("role") {
+                                    print!(" (role: {role})");
+                                }
+                                println!();
+                            }
+                        }
+                        if let Some(sid) = ev.get("subject_id") {
+                            println!("      subject: {sid}");
+                        }
+                        // Show detail (the user-provided evidence)
+                        if let Some(detail) = ev.get("detail") {
+                            if !detail.is_null() {
+                                println!("      detail: {detail}");
+                            }
+                        }
+                        // For receipts without the actor/subject structure, show raw
+                        if ev.get("actor").is_none() {
+                            println!(
+                                "      evidence: {}",
+                                serde_json::to_string_pretty(&ev)?
+                                    .lines()
+                                    .collect::<Vec<_>>()
+                                    .join("\n               ")
+                            );
+                        }
                     }
                 }
+                println!();
             }
         }
         QueryAction::Why { id } => {
+            let grant = store.get_grant(&id)?;
             let chain = store.receipt_chain(&id)?;
             if chain.is_empty() {
                 println!("no receipts for grant {id}");
@@ -472,6 +520,18 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
             }
 
             println!("why was grant {id} allowed/denied?\n");
+
+            // Show grant identity binding
+            if let Some(ref g) = grant {
+                println!("  subject: {} ({})", g.subject_id, g.actor);
+                println!("  scope:   {} → {}", g.action, g.target);
+                println!("  state:   {}", g.state);
+                if let Some(ref exp) = g.expires_at {
+                    println!("  expires: {exp}");
+                }
+                println!();
+            }
+
             for r in &chain {
                 match r.kind.as_str() {
                     "policy_decision" => {
@@ -492,17 +552,24 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                     "grant_issued" => {
                         println!("\n  grant issued:");
                         println!("    digest: {}", r.digest);
-                        println!("    time: {}", r.timestamp);
+                        println!("    time:   {}", r.timestamp);
+                        print_actor_from_evidence(&r.evidence);
                     }
                     "grant_denied" => {
                         println!("\n  grant denied:");
                         println!("    digest: {}", r.digest);
-                        println!("    time: {}", r.timestamp);
+                        println!("    time:   {}", r.timestamp);
                         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence) {
                             if let Some(reason) = ev.get("reason") {
                                 println!("    reason: {reason}");
                             }
                         }
+                    }
+                    "grant_activated" | "grant_used" | "grant_revoked" | "grant_expired" | "grant_abandoned" => {
+                        println!("\n  {}:", r.kind.replace('_', " "));
+                        println!("    digest: {}", r.digest);
+                        println!("    time:   {}", r.timestamp);
+                        print_actor_from_evidence(&r.evidence);
                     }
                     _ => {}
                 }
