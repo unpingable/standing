@@ -109,6 +109,10 @@ pub struct VerifyOptions {
     pub expected_audience: String,
     /// Clock skew tolerance in seconds (default: 30)
     pub skew_secs: i64,
+    /// Maximum acceptable gap between issuer time and verifier time (default: 300s).
+    /// If the gap exceeds this, the assessment is compromised — we cannot
+    /// confidently evaluate freshness.
+    pub max_clock_divergence_secs: i64,
     /// Verifier's current time (default: Utc::now()). Exposed for testing.
     pub now: Option<DateTime<Utc>>,
 }
@@ -118,6 +122,7 @@ impl Default for VerifyOptions {
         Self {
             expected_audience: "standing".to_string(),
             skew_secs: DEFAULT_SKEW_SECS,
+            max_clock_divergence_secs: 300,
             now: None,
         }
     }
@@ -169,20 +174,43 @@ pub fn verify_identity(
         return AssessmentResult::InvalidSignature;
     }
 
+    // Step 2: Temporal coherence — expires_at must be after issued_at.
+    // A signed assertion where expiry precedes issuance is either a
+    // compromised issuer or a clock disaster. Either way, we cannot
+    // assess standing.
+    if id.expires_at <= id.issued_at {
+        return AssessmentResult::AssessmentCompromised;
+    }
+
     let now = opts.now.unwrap_or_else(Utc::now);
     let skew = Duration::seconds(opts.skew_secs);
 
-    // Step 2: Not-yet-valid (issued_at in the future beyond skew)
+    // Step 3: Clock divergence — if verifier time and issuer time are
+    // too far apart, we cannot confidently evaluate freshness. The
+    // signature is valid but the temporal assessment is unreliable.
+    let divergence = (now - id.issued_at).num_seconds().abs();
+    let max_divergence = opts.max_clock_divergence_secs;
+    if divergence > max_divergence {
+        // Exception: if the identity is clearly expired (well past
+        // expires_at + skew + divergence budget), we can still say
+        // "expired" with confidence even under clock uncertainty.
+        if now > id.expires_at + Duration::seconds(max_divergence) {
+            return AssessmentResult::Expired;
+        }
+        return AssessmentResult::AssessmentCompromised;
+    }
+
+    // Step 4: Not-yet-valid (issued_at in the future beyond skew)
     if id.issued_at > now + skew {
         return AssessmentResult::NotYetValid;
     }
 
-    // Step 3: Expiry (with skew tolerance)
+    // Step 5: Expiry (with skew tolerance)
     if now > id.expires_at + skew {
         return AssessmentResult::Expired;
     }
 
-    // Step 4: Audience
+    // Step 6: Audience
     if id.audience != opts.expected_audience {
         return AssessmentResult::AudienceMismatch;
     }
@@ -417,11 +445,86 @@ mod tests {
     fn future_issued_at_rejected() {
         let id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
 
-        // Verify as if we're 5 minutes in the past (beyond 30s skew)
-        let past = Utc::now() - Duration::seconds(300);
+        // Verify as if we're 60s in the past (beyond 30s skew, within 300s divergence)
+        let past = Utc::now() - Duration::seconds(60);
         let vopts = VerifyOptions { now: Some(past), ..default_verify() };
         let result = verify_identity(&id, SECRET, &vopts);
         assert_eq!(result, AssessmentResult::NotYetValid);
+    }
+
+    // ---------------------------------------------------------------
+    // AssessmentCompromised conditions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn temporal_incoherence_is_compromised() {
+        // expires_at before issued_at — signed but nonsensical
+        let mut id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+        let bad_expires = id.issued_at - Duration::seconds(100);
+        // Re-sign with the bad expiry so signature is valid
+        id.expires_at = bad_expires;
+        id.signature = sign(
+            &id.jti, &id.name, &id.location, &id.audience,
+            &id.issued_at, &id.expires_at, SECRET,
+        ).unwrap();
+
+        let result = verify_identity(&id, SECRET, &default_verify());
+        assert_eq!(result, AssessmentResult::AssessmentCompromised);
+    }
+
+    #[test]
+    fn extreme_clock_divergence_is_compromised() {
+        let id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+
+        // Verifier clock is 10 minutes behind issuer (beyond 300s max divergence)
+        let way_past = Utc::now() - Duration::seconds(601);
+        let vopts = VerifyOptions { now: Some(way_past), ..default_verify() };
+        let result = verify_identity(&id, SECRET, &vopts);
+        assert_eq!(result, AssessmentResult::AssessmentCompromised);
+    }
+
+    #[test]
+    fn extreme_clock_divergence_forward_is_compromised() {
+        let id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+
+        // Verifier clock is 10 minutes ahead of issuer (beyond 300s max divergence)
+        // But identity is not yet expired (1hr TTL), so this is clock uncertainty
+        let way_future = Utc::now() + Duration::seconds(601);
+        let vopts = VerifyOptions { now: Some(way_future), ..default_verify() };
+        let result = verify_identity(&id, SECRET, &vopts);
+        // Within the identity's lifetime but beyond divergence budget —
+        // we can't trust our temporal assessment
+        assert_eq!(result, AssessmentResult::AssessmentCompromised);
+    }
+
+    #[test]
+    fn extreme_divergence_but_clearly_expired_is_expired() {
+        // If the identity is so old that even accounting for max divergence
+        // it's definitely expired, we can say Expired with confidence
+        let opts = CreateOptions { ttl_secs: 10, ..default_opts() };
+        let id = create_identity("bot", "host-1", SECRET, &opts).unwrap();
+
+        // Verifier is 20 minutes in the future — way beyond divergence,
+        // but also way beyond the 10s TTL + 300s divergence budget
+        let way_future = Utc::now() + Duration::seconds(1200);
+        let vopts = VerifyOptions { now: Some(way_future), ..default_verify() };
+        let result = verify_identity(&id, SECRET, &vopts);
+        assert_eq!(result, AssessmentResult::Expired);
+    }
+
+    #[test]
+    fn tight_divergence_budget_catches_moderate_skew() {
+        let id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+
+        // Tighten max divergence to 10s
+        let slightly_past = Utc::now() - Duration::seconds(15);
+        let vopts = VerifyOptions {
+            now: Some(slightly_past),
+            max_clock_divergence_secs: 10,
+            ..default_verify()
+        };
+        let result = verify_identity(&id, SECRET, &vopts);
+        assert_eq!(result, AssessmentResult::AssessmentCompromised);
     }
 
     #[test]
