@@ -10,4 +10,5 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 thiserror = { workspace = true }

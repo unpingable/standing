@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use standing_grant::{ActorContext, GrantMachine, GrantRequest, GrantScope, Principal};
-use standing_identity::{WorkloadId, verify_and_resolve};
+use standing_identity::{WorkloadId, verify_and_resolve, CreateOptions, VerifyOptions};
 use standing_policy::{HardcodedPolicy, PolicyEvaluator, Verdict};
 use standing_store::{GrantMeta, Store};
 
@@ -47,6 +47,12 @@ enum IdentityAction {
         /// Shared secret for HMAC signing
         #[arg(long)]
         secret: String,
+        /// Audience (default: "standing")
+        #[arg(long, default_value = "standing")]
+        audience: String,
+        /// TTL in seconds (default: 3600)
+        #[arg(long, default_value = "3600")]
+        ttl: i64,
     },
     /// Verify an existing identity file
     Verify {
@@ -56,6 +62,9 @@ enum IdentityAction {
         /// Shared secret for HMAC verification
         #[arg(long)]
         secret: String,
+        /// Expected audience (default: "standing")
+        #[arg(long, default_value = "standing")]
+        audience: String,
     },
 }
 
@@ -179,7 +188,8 @@ fn resolve_identity(
         .map_err(|e| format!("cannot read identity file {identity_path}: {e}"))?;
     let wid: WorkloadId = serde_json::from_str(&data)
         .map_err(|e| format!("malformed identity file {identity_path}: {e}"))?;
-    let verified = verify_and_resolve(&wid, secret.as_bytes())
+    let opts = VerifyOptions::default();
+    let verified = verify_and_resolve(&wid, secret.as_bytes(), &opts)
         .map_err(|e| format!("identity verification failed: {e}"))?;
     let principal = Principal::new(verified.principal_id, verified.label);
     Ok((principal, wid))
@@ -191,15 +201,37 @@ fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Err
             name,
             location,
             secret,
+            audience,
+            ttl,
         } => {
-            let id = standing_identity::create_identity(&name, &location, secret.as_bytes())?;
+            let opts = CreateOptions {
+                ttl_secs: ttl,
+                audience,
+            };
+            let id = standing_identity::create_identity(&name, &location, secret.as_bytes(), &opts)?;
             let json = serde_json::to_string_pretty(&id)?;
             println!("{json}");
         }
-        IdentityAction::Verify { identity, secret } => {
-            let (principal, _wid) = resolve_identity(&identity, &secret)?;
-            println!("verified: {}", principal.id);
-            println!("  label: {}", principal.label);
+        IdentityAction::Verify {
+            identity,
+            secret,
+            audience,
+        } => {
+            let data = std::fs::read_to_string(&identity)
+                .map_err(|e| format!("cannot read identity file: {e}"))?;
+            let wid: WorkloadId = serde_json::from_str(&data)
+                .map_err(|e| format!("malformed identity file: {e}"))?;
+            let opts = VerifyOptions {
+                expected_audience: audience,
+                ..VerifyOptions::default()
+            };
+            let verified = verify_and_resolve(&wid, secret.as_bytes(), &opts)
+                .map_err(|e| format!("identity verification failed: {e}"))?;
+            println!("verified: {}", verified.principal_id);
+            println!("  label: {}", verified.label);
+            println!("  audience: {}", verified.audience);
+            println!("  jti: {}", verified.jti);
+            println!("  expires: {}", wid.expires_at.to_rfc3339());
         }
     }
     Ok(())
