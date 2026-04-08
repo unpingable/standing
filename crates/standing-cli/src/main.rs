@@ -208,6 +208,7 @@ fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Err
             let opts = CreateOptions {
                 ttl_secs: ttl,
                 audience,
+                ..CreateOptions::default()
             };
             let id = standing_identity::create_identity(&name, &location, secret.as_bytes(), &opts)?;
             let json = serde_json::to_string_pretty(&id)?;

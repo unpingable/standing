@@ -12,11 +12,17 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Current schema version for identity claims.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// Default identity TTL: 1 hour.
 pub const DEFAULT_TTL_SECS: i64 = 3600;
 
 /// Default clock skew tolerance: 30 seconds.
 pub const DEFAULT_SKEW_SECS: i64 = 30;
+
+/// Default key ID when none specified.
+pub const DEFAULT_KID: &str = "default";
 
 /// A workload identity claim.
 ///
@@ -24,6 +30,11 @@ pub const DEFAULT_SKEW_SECS: i64 = 30;
 /// not JWT — it's a simpler HMAC-signed blob with explicit semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadId {
+    /// Schema version. Verifiers must reject unknown versions.
+    pub schema_version: u32,
+    /// Key ID used to sign this claim. Verifier uses this to select
+    /// the correct secret for verification.
+    pub kid: String,
     /// Unique claim ID (jti). For replay detection.
     pub jti: String,
     /// Name of the workload (e.g., "deploy-bot")
@@ -69,6 +80,10 @@ pub enum AssessmentResult {
     NotYetValid,
     /// This jti has already been presented within its validity window
     ReplayDetected,
+    /// Schema version is not supported by this verifier
+    UnsupportedVersion,
+    /// Key ID is not known to this verifier
+    UnknownKeyId,
     /// Cannot safely determine standing (e.g., clock uncertainty)
     AssessmentCompromised,
 }
@@ -92,6 +107,8 @@ pub struct CreateOptions {
     pub ttl_secs: i64,
     /// Audience (e.g., "standing:prod")
     pub audience: String,
+    /// Key ID (default: "default")
+    pub kid: String,
 }
 
 impl Default for CreateOptions {
@@ -99,6 +116,7 @@ impl Default for CreateOptions {
         Self {
             ttl_secs: DEFAULT_TTL_SECS,
             audience: "standing".to_string(),
+            kid: DEFAULT_KID.to_string(),
         }
     }
 }
@@ -141,10 +159,13 @@ pub fn create_identity(
     let issued_at = Utc::now();
     let expires_at = issued_at + Duration::seconds(opts.ttl_secs);
     let audience = opts.audience.clone();
+    let kid = opts.kid.clone();
 
-    let signature = sign(&jti, &name, &location, &audience, &issued_at, &expires_at, secret)?;
+    let signature = sign(SCHEMA_VERSION, &kid, &jti, &name, &location, &audience, &issued_at, &expires_at, secret)?;
 
     Ok(WorkloadId {
+        schema_version: SCHEMA_VERSION,
+        kid,
         jti,
         name,
         location,
@@ -155,16 +176,26 @@ pub fn create_identity(
     })
 }
 
-/// Verify a workload identity: signature, expiry, audience.
+/// Verify a workload identity: version, signature, expiry, audience.
 /// Returns AssessmentResult for every outcome — not just pass/fail.
+///
+/// The `secret` parameter is the key material for the claim's `kid`.
+/// Callers should resolve kid → secret before calling this function.
+/// If the kid is unknown, return `AssessmentResult::UnknownKeyId` directly.
 pub fn verify_identity(
     id: &WorkloadId,
     secret: &[u8],
     opts: &VerifyOptions,
 ) -> AssessmentResult {
-    // Step 1: Signature
+    // Step 0: Schema version — reject unknown versions before anything else.
+    // This is the one check that must survive all future evolution.
+    if id.schema_version != SCHEMA_VERSION {
+        return AssessmentResult::UnsupportedVersion;
+    }
+
+    // Step 1: Signature (includes schema_version and kid in the MAC)
     let expected = match sign(
-        &id.jti, &id.name, &id.location, &id.audience,
+        id.schema_version, &id.kid, &id.jti, &id.name, &id.location, &id.audience,
         &id.issued_at, &id.expires_at, secret,
     ) {
         Ok(s) => s,
@@ -317,6 +348,8 @@ pub trait ReplayGuard {
 }
 
 fn sign(
+    schema_version: u32,
+    kid: &str,
     jti: &str,
     name: &str,
     location: &str,
@@ -327,6 +360,12 @@ fn sign(
 ) -> Result<String, IdentityError> {
     let mut mac =
         HmacSha256::new_from_slice(secret).map_err(|e| IdentityError::Hmac(e.to_string()))?;
+    // schema_version and kid are part of the signed payload —
+    // changing either invalidates the signature.
+    mac.update(schema_version.to_string().as_bytes());
+    mac.update(b"|");
+    mac.update(kid.as_bytes());
+    mac.update(b"|");
     mac.update(jti.as_bytes());
     mac.update(b"|");
     mac.update(name.as_bytes());
@@ -464,7 +503,7 @@ mod tests {
         // Re-sign with the bad expiry so signature is valid
         id.expires_at = bad_expires;
         id.signature = sign(
-            &id.jti, &id.name, &id.location, &id.audience,
+            id.schema_version, &id.kid, &id.jti, &id.name, &id.location, &id.audience,
             &id.issued_at, &id.expires_at, SECRET,
         ).unwrap();
 
@@ -549,5 +588,58 @@ mod tests {
             }
             _ => panic!("expected Assessment error"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Schema version and kid
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn identity_has_schema_version_and_kid() {
+        let id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+        assert_eq!(id.schema_version, SCHEMA_VERSION);
+        assert_eq!(id.kid, "default");
+    }
+
+    #[test]
+    fn custom_kid() {
+        let opts = CreateOptions {
+            kid: "prod-key-2026".to_string(),
+            ..default_opts()
+        };
+        let id = create_identity("bot", "host-1", SECRET, &opts).unwrap();
+        assert_eq!(id.kid, "prod-key-2026");
+
+        let result = verify_identity(&id, SECRET, &default_verify());
+        assert_eq!(result, AssessmentResult::Valid);
+    }
+
+    #[test]
+    fn unknown_schema_version_rejected() {
+        let mut id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+        // Tamper the version (signature will mismatch, but version check is first)
+        id.schema_version = 99;
+
+        let result = verify_identity(&id, SECRET, &default_verify());
+        assert_eq!(result, AssessmentResult::UnsupportedVersion);
+    }
+
+    #[test]
+    fn version_zero_rejected() {
+        let mut id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+        id.schema_version = 0;
+
+        let result = verify_identity(&id, SECRET, &default_verify());
+        assert_eq!(result, AssessmentResult::UnsupportedVersion);
+    }
+
+    #[test]
+    fn tampered_kid_fails_signature() {
+        let mut id = create_identity("bot", "host-1", SECRET, &default_opts()).unwrap();
+        // kid is part of the signature — changing it without re-signing fails
+        id.kid = "stolen-key".to_string();
+
+        let result = verify_identity(&id, SECRET, &default_verify());
+        assert_eq!(result, AssessmentResult::InvalidSignature);
     }
 }
