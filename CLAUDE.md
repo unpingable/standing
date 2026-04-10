@@ -54,6 +54,15 @@ standing grant sweep
 - Entry point: `cargo run -p standing-cli -- <args>`
 - Receipt format is WLP-compatible (canonical JSON, SHA-256, no signatures yet)
 
+## Debugging Discipline
+
+Shared doctrine across the constellation (annotated source: `agent_gov/CLAUDE.md`):
+
+- **Default to reduction.** Escalate to integration only after reduction has failed to discriminate.
+- **Belief must be earned by the cheapest available falsification, not constructed by accretion.**
+
+**In this project**, "load-bearing" means the moment a grant is about to activate, an identity claim is about to be accepted, or a receipt is about to be emitted that downstream systems will rely on. The cheapest discriminating test is usually: re-verify the HMAC and re-read the current grant state from the store, not from the in-memory copy. The fail-closed-on-receipts invariant is the static version; this is its dynamic version.
+
 ## Don't
 
 - Don't collapse into agent governance or health monitoring
