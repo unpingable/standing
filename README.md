@@ -2,7 +2,17 @@
 
 Observable standing/entitlement for automation and workloads.
 
-Modern infra is good at telling you whether a service is alive and much worse at telling you whether it was entitled to do what it just did.
+Modern systems are good at proving possession of credentials. They are much worse at proving entitlement to consequence.
+
+Credential validity is not claim validity. Access to a boundary does not imply standing to perform a consequential action, or to make an assertion that downstream systems may treat as binding.
+
+Standing records and exposes scoped entitlement at a boundary: who had standing, for what action, over what target, within what scope and time window, under what policy, and with what receipt chain.
+
+Kerberos made service access presentable. Standing makes consequence entitlement observable.
+
+Standing does not implement Kerberos-style ticket transport. Grants are recorded and verified against authoritative state rather than carried by workloads or agents as self-justifying legitimacy.
+
+Current Standing models **entitlement-to-act**: whether an actor may perform an operation against a target. Agentic systems also expose a neighboring need, **entitlement-to-assert**, where the relevant object is a claim that may affect downstream consequence. That surface is roadmap only; its schema and receipt format are not yet designed.
 
 ## What it does
 
@@ -14,9 +24,22 @@ Modern infra is good at telling you whether a service is alive and much worse at
 
 ## What this is not
 
-- Not health observability (see [NQ](https://github.com/jbeck/nq))
-- Not agent governance (see [Governor](https://github.com/jbeck/agent_gov))
+- Not an identity provider, policy engine, admissibility governor, actuator, workflow engine, or agent platform
+- Not claim preflight or witness/testimony infrastructure; adjacent systems such as [NQ](https://github.com/jbeck/nq) answer what can be said from evidence
+- Not an admissibility lock; an admissibility layer such as Wicket or a consuming [Governor](https://github.com/jbeck/agent_gov) decides whether entitlement may bind consequence
 - Not a secret store, service mesh, workforce IAM, or PKI project
+
+Standing may verify principals or workload identity at grant boundaries, but it does not issue identities. Identity is substrate.
+
+## Conceptual stack
+
+```text
+Identity substrate      who/what is acting
+Access authorization    may it reach the service or boundary
+Standing                does it have scoped entitlement here
+Admissibility layer     may this bind consequence
+Continuity/afterlife    what remains live, stale, watched, or constrained later
+```
 
 ## Quick start
 
