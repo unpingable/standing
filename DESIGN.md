@@ -1,3 +1,5 @@
+> **Historical design/provenance.** Slice 1 implementation diverged; current architecture lives in README, AGENTS.md, and SLICE-1-CLOSEOUT.md. Do not rewrite this into current state — it preserves useful stratigraphy.
+
 # nq-standing
 
 **Observable standing for automation and workloads**

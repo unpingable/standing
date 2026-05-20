@@ -1,4 +1,6 @@
-# Governor ↔ nq-standing Crosswalk
+# Governor ↔ Standing Crosswalk
+
+> **Status (2026-05-20):** Standing-side primitive shipped; AG-side adoption exists; this remains a crosswalk/reference, not a current integration plan. Body retains pre-rename "nq-standing" naming.
 
 Governor is nq-standing for agents. nq-standing is Governor for production workloads.
 

@@ -82,6 +82,8 @@ These augment the existing invariants in CLAUDE.md:
 5. **Compromise recovery plan** (scar 24) — documented procedure for
    shared secret rotation
 
+**Post-slice-1 status (2026-05-20):** Items 1–4 (audience restriction, identity expiry, replay resistance, assessment-compromised state) shipped in slice 1; see `SLICE-1-CLOSEOUT.md`. Item 5 (compromise recovery plan) remains deferred to v1 hardening.
+
 ## The general law
 
 Identity systems do not usually die because signatures are fake. They die

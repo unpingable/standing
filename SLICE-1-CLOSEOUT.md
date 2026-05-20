@@ -51,7 +51,7 @@ These are out of scope for v1. Not "later" — **not this project version**:
 
 ## Completion runway
 
-1. **Integrate into Agent Governor** — first real consumer, replace trusted actor construction
+1. **Integrate into Agent Governor** — first real consumer, replace trusted actor construction. **Status: complete from Standing's side; AG-side workload identity adopted 2026-04-07.**
 2. **Add schema_version + kid** — cheap future-proofing before migrations get expensive
 3. **Decide bearer vs PoP** — the central theft story for v1
 4. **Break-glass + compromise recovery** — emergency honesty
