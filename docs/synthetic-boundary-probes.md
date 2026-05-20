@@ -88,6 +88,41 @@ architecture-mode (constitutional amendment to authority model).
 Runtime policy tuning belongs to ops-mode. Don't collapse them. This
 probe blocks "runtime pressure amended the constitution."
 
+## Hot-path readiness: visible before binding
+
+Standing is not currently a hot-path enforcement dependency.
+
+This project may expose standing-shaped outputs before any consumer
+treats them as binding. That is intentional. Standing should become
+visible before it becomes authoritative.
+
+A consumer that chooses to wire Standing into a binding workflow
+should preserve the following distinctions:
+
+1. Standing is not identity. An actor may be known without having
+   standing for a given object, scope, or consequence.
+
+2. Standing is not evidence. A valid observation may still come from
+   a source that lacks standing to bind the workflow.
+
+3. Standing is not authorization. Authorization answers whether an
+   operation may proceed. Standing answers whose relation to the
+   object is allowed to matter for that decision.
+
+4. Standing must not be decorative once wired into a binding path.
+   If a consumer treats Standing as part of a binding workflow,
+   Standing must be capable of blocking, downgrading, routing, or
+   requiring an open finding. Otherwise the integration is only
+   annotation.
+
+5. Pre-binding outputs remain advisory. Until a consumer explicitly
+   wires Standing into enforcement, Standing outputs are
+   receipt-visible / diagnostic / representational, not binding.
+
+The design constraint for Standing itself is representational
+readiness: do not emit shapes that make future hot-path enforcement
+impossible without changing the meaning of prior outputs.
+
 ## Keeper line
 
 > Standing synthetic work is allowed only while it refuses to pretend
