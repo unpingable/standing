@@ -82,6 +82,36 @@ Invariants (mirrored from the act primitive):
 - Receipts at every state transition that *does* exist. Fail-closed on receipts.
 - Content-addressed (RFC 8785 JCS + SHA-256). WLP-compatible.
 
+### `subject_id` vs `subject_scope` — vocabulary that should stop blurring
+
+Two related things hide under one name in the slice-1 / MVP code. The doc keeps them distinct from here on:
+
+```text
+subject_id     the concrete subject of one specific assertion or
+               testimony packet. E.g. "labelwatch/foo",
+               "host:storage01", "ns_observation_loop".
+
+subject_scope  the grant's coverage pattern; the class of subjects
+               the grant authorises a speaker to assert about.
+               E.g. "labelwatch/*", "host:storage01" (exact),
+               "ns/*".
+```
+
+A `StandingRequest` carries a `subject_id` (the concrete thing being asserted about right now). A grant — `AssertionGrant` (Phase 4) or a `StaticConfigEntry` (MVP) — carries a `subject_scope` (the pattern of subjects the grant covers). The matching function asks: *does this grant's subject_scope cover that request's subject_id?*
+
+The current MVP code field is named `subject_scope` on both sides for slice-1 reasons; that does not need to change today. The doc stops conflating them, because the distinction is load-bearing for component-testimony and for the eventual Phase 4 lease-shaped grant.
+
+Sibling-side names for the same distinction:
+
+```text
+NQ-NS bilateral spike
+  (~/git/cartography/coordination/NQ-NS-CHANNEL-SPLIT.md)
+  subject_id     same meaning as here
+  coverage_scope grant-pattern-on-the-NQ-receiving-side (a
+                 declared-coverage entry, not a Standing grant
+                 itself, but composes against the same axis).
+```
+
 ## Grant vs request proof — the Kerberos split
 
 Standing borrows shape from Kerberos-like systems: a long-lived (well, lease-long) grant and a per-request proof. **Do not let "has grant" become "any packet with that grant ID is valid forever."**
@@ -142,6 +172,36 @@ audience: "wicket:local"
 ```
 
 A grant meant for one NQ instance is **not** portable to another NQ instance. Cross-instance use is a Kerberos-shaped failure (ticket for one realm replayed to another).
+
+## Imported sibling vocabulary (provisional)
+
+Standing does not own the axis or action-class taxonomies. They are sibling vocabulary, used here to compose against NQ, NS, Wicket, and AG without redefining them. Convergence is cartography's job, not Standing's. The lists below are *recognised and provisional* — Standing carries / evaluates standing over requests that reference these surfaces, but Standing does not enumerate them as authoritative or ratify them.
+
+**Axes** (NQ/NS own these; Standing does not):
+
+```text
+truth           substrate-state testimony (what is the world like?)
+posture         classified verdicts derived from truth (how should we read it?)
+ack             operator intent (what has a human resolved?)
+```
+
+`truth / posture / ack` are claim axes — categorical layers of what kind of claim is being made. Standing may evaluate standing over a request whose claim references one of these axes, but the axis itself is not Standing's vocabulary.
+
+**Action-classes** (cartography doctrine + NQ-NS bilateral; Standing imports):
+
+```text
+read                            one-shot query; standing not durable
+lifecycle                       ack / quiesce / suppress / close
+configuration                   saved-query CRUD; declared-context updates
+admin                           schema / migration / runtime controls
+component-testimony             producer-side emit of self-attestation
+component-testimony-subscription durable consumer-side standing to receive
+action-preflight                inbound request to perform an action
+```
+
+`component-testimony` is a testimony / action surface — a producer-side emit. `component-testimony-subscription` is a separate action-class — durable consumer-side standing to receive. **Neither is an axis.** The temptation to write `axis = component-testimony-subscription` is exactly the schema-fossil to refuse.
+
+Standing's resolver assesses requests carrying any of these action-classes; the wire shape per action-class remains sibling-owned (cartography + the consuming repo). Standing does not ratify additions to either list — recognise + compose, not enumerate + own.
 
 ## Scope matching semantics
 
@@ -428,6 +488,30 @@ Mirrored from cartography:
 - **"Standing tool isn't built yet, so we'll skip it."** The seam must exist even when the only resolver is `StaticConfigResolver`.
 - **"Auth before we name the read boundary."** Auth without named read boundaries is a login screen on arbitrary SQL.
 
+## The subscription inversion (deferred)
+
+Standing's current shape — `StandingRequest`, `StandingDecision`, the four resolver modes, the assertion-grant lifecycle anticipated for Phase 4 — assumes **emission semantics**:
+
+```text
+actor (speaker, upstream) → audience (listener, downstream)
+```
+
+Subscription does not fit this shape cleanly. The `component-testimony-subscription` action-class imported above inverts the direction:
+
+```text
+actor (subscriber, downstream) ← source (producer, upstream)
+```
+
+In subscription, the actor is the would-be receiver; the standing being requested is *durable receive-standing* rather than *one-shot emit-standing*; and the natural "audience" of the subscription grant points upstream to the producer, opposite direction from emission. NQ-NS proposes subscription as a peer action-class precisely because lease-shaped Standing-tool primitives (expiry, revocation, per-audience scope) matter for subscription in a way they do not matter for one-shot reads.
+
+Standing recognises the inversion but does not solve it here. The naming below is provisional and *not* a wire commitment:
+
+```text
+standing_kind = emit (assertion) | receive (subscription)
+```
+
+Subscription wire shape, `StandingRequest` field-naming for the receive case, audience-direction discipline in receipts, and lease semantics for durable receive-standing all belong to Phase 4 or later. Naming the hole; not pouring concrete into it while the plumbers are still yelling.
+
 ## What this document does not specify
 
 Deferred until forcing cases converge:
@@ -437,6 +521,70 @@ Deferred until forcing cases converge:
 - Cross-component revocation propagation semantics.
 - Audit-aggregation surface (constellation-wide audit composition).
 - Daemon / HTTP service shape. Library-embedded through MVP and probably through 1.0.
+- **Producer-side time fields.** NQ-NS witness packets distinguish `generated_at` (producer-side, when the packet was minted) and `observed_at` (observer-side, when the underlying event was caught) from verifier-side `evaluated_at` / `now`. Standing today carries only verifier-side time. Phase 4 likely needs to carry producer-side time alongside; the MVP code is not retrofitted now.
+- **Subscription / receive-standing shape.** See "The subscription inversion" above.
+- **Full action-class and axis convergence.** Standing imports sibling vocabulary as provisional; cartography owns convergence; the lists in "Imported sibling vocabulary" are subject to extension from sibling filings.
+
+## Composition with sibling filings (as of 2026-05-28)
+
+The cross-constellation surface this document composes with is moving fast. Snapshot of who's filed what, so a reader does not have to triangulate it from a dozen repos:
+
+```text
+Cartography (constellation-shared)
+  nq-REMOTE_STANDING_BOUNDARY.md             primitive / candidate doctrine
+    (2026-05-27, NQ-Claude origin)
+  NQ-NS-CHANNEL-SPLIT.md                     bilateral planning spike
+    (2026-05-28, NS-Claude origin)
+  SELF-SUBJECT-COLLAPSE.md                   cross-component shared gap
+    (2026-05-28, three forcing instances:
+     NS, NQ-on-NQ, agent_gov GOV_GAP_BASIS_001)
+  wlp-notes-as-wire-layer-for-standing-boundary.md
+    (2026-05-28, Wicket-Claude origin;
+     constellation-side WLP cross-ref)
+
+NQ
+  REMOTE_SURFACE_AUTH_AND_STANDING_GAP.md    NQ-local manifestation
+  NQ_NS_CHANNEL_SPLIT_NQ_SIDE.md             NQ half of bilateral spike
+  WITNESS_IDENTITY_AND_ABSENCE_GAP.md §2     canonical absence taxonomy
+                                              (7 states + MAY-split)
+
+Wicket
+  WICKET_REMOTE_STANDING_ADAPTER_GAP.md      filed 2026-05-27;
+    consumer-gated adapter, not implemented.
+    Names the vocabulary boundary:
+    Standing AssertionGrant / StandingDecision
+      ≠ Wicket ActorStanding / StandingClass.
+
+WLP
+  WLP_STANDING_BOUNDARY_CROSSREF.md          filed 2026-05-28;
+    WLP is the wire layer BELOW the receipt/audit slot,
+    not a peer component, not the reconciler.
+    StandingDecision serialises as a WLP AuthorizationReceipt;
+    WLP carries decisions, does not make them.
+
+NS (Nightshift)
+  NQ_NS_CHANNEL_SPLIT_NS_SIDE.md             pending; NS-Claude
+    expected to file the NS-local channel-split half.
+```
+
+Standing's role across this set: speaker / requester entitlement, with `StandingDecision` as the artifact the others compose against. Standing does not own the per-component manifestation list; cartography curates it.
+
+**Forcing pressures on Phase 4** (consumer-gated lease-shaped `AssertionGrant` lifecycle), updated:
+
+```text
+1. NQ binding flip — visible_not_binding → binding for remote
+   preflight ingestion. The original wedge.
+2. Wicket adapter — Intent.caller_assertion_standing or
+   equivalent; gated on a Wicket consumer plant.
+3. Self-subject external reconciliation — SELF-SUBJECT-COLLAPSE
+   names operator-as-external-reconciler under lease-shaped
+   Standing as one of three resolution paths. Standing-tool
+   Phase 4 lease semantics are the gate for path (b).
+4. component-testimony-subscription — durable receive-standing
+   needs lease semantics in a way one-shot reads do not.
+```
+
+Any one of those gates Phase 4 by itself; the four together raise the priority but do not change the discipline. Standing waits for a concrete consumer to knock before building.
 
 ## Relationship to existing Standing docs
 
@@ -469,6 +617,9 @@ Principal canonicalization is authorization logic.
 
 Time bugs become security bugs wearing a calendar.
 
+Axes describe what is claimed. Action-classes describe what is being done.
+Conflating them is tomorrow's schema fossil.
+
 Loose coupling is allowed. Ambiguous standing is not.
 ```
 
@@ -477,3 +628,5 @@ Loose coupling is allowed. Ambiguous standing is not.
 Filed 2026-05-27 as Standing's local manifestation of `~/git/cartography/coordination/nq-REMOTE_STANDING_BOUNDARY.md`. Forcing case: NQ, Nightshift, and Wicket no longer co-located; the boundary that was implicit becomes explicit when calls cross machines.
 
 Two review passes incorporated 2026-05-27: ChatGPT roadmap nits (phase numbering, MVP scope reduced to resolver+StaticConfig, lease-shaped not action-shaped, explicit `standing_enforced` receipt fields, ingestion-vs-claim-authority distinction, scope matching semantics, softened forward-compat claims) and a Kerberos-scars amendment set (grant-vs-request-proof split, canonical principal/audience naming, replay cache per audience, delegation-denied default, TTL-first revocation, keytab doctrine, clock-skew doctrine, authorization-data-is-not-truth, realm/federation explicitly unsupported, Kerberos-lineage-not-mechanism non-goal).
+
+Paper-only reconciliation 2026-05-28 against sibling filings that landed between Standing's MVP commit and the next operator session: NQ-NS bilateral channel-split spike, SELF-SUBJECT-COLLAPSE shared gap, Wicket's `WICKET_REMOTE_STANDING_ADAPTER_GAP.md`, WLP's two cross-references, NQ's `NQ_NS_CHANNEL_SPLIT_NQ_SIDE.md`. Vocabulary discipline added: `subject_id` vs `subject_scope` distinction, axes (truth/posture/ack) recognised as sibling-owned, action-classes enumerated as imported/provisional, `component-testimony-subscription` recognised as an action-class **not** an axis, subscription/emission directional inversion named as a deferred design question, producer-side time fields named as deferred. Phase 4 forcing pressures updated to four. No code changed; no sibling repo artifacts edited from Standing.
