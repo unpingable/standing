@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 use standing_grant::{ActorContext, GrantMachine, GrantRequest, GrantScope, Principal};
 use standing_identity::{WorkloadId, verify_and_resolve, verify_and_resolve_with_replay, CreateOptions, ReplayGuard, VerifyOptions};
-use standing_policy::{HardcodedPolicy, PolicyEvaluator, Verdict};
+use standing_policy::{
+    DenyAllResolver, HardcodedPolicy, LocalOnlyResolver, PolicyEvaluator, ResolverMode,
+    StandingRequest, StandingResolver, StaticConfig, StaticConfigResolver, Verdict,
+};
 use standing_store::{GrantMeta, Store};
 
 #[derive(Parser)]
@@ -32,6 +35,44 @@ enum Commands {
         #[command(subcommand)]
         action: QueryAction,
     },
+    /// Remote-boundary standing resolver (entitlement-to-assert).
+    /// See docs/remote-standing-boundary.md.
+    Resolver {
+        #[command(subcommand)]
+        action: ResolverAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResolverAction {
+    /// Evaluate a StandingRequest against a resolver and print the
+    /// StandingDecision as canonical JSON.
+    Test {
+        /// Resolver to evaluate against: deny_all, local_only, static_config
+        #[arg(long, default_value = "static_config")]
+        resolver: String,
+        /// Path to TOML config (required for static_config)
+        #[arg(long)]
+        config: Option<String>,
+        /// Canonical principal id of the calling actor (e.g.
+        /// "component:nq:linode", "human:jbeck", "workload:bot:host-a")
+        #[arg(long)]
+        actor: String,
+        /// Claim kind being asserted (e.g. "sqlite_wal_state")
+        #[arg(long, name = "claim-kind")]
+        claim_kind: String,
+        /// Subject scope (e.g. "labelwatch/foo", "host:storage01")
+        #[arg(long, name = "subject-scope")]
+        subject_scope: String,
+        /// Instance-qualified audience (e.g. "nq:main")
+        #[arg(long)]
+        audience: String,
+        /// Resolver mode: visible_not_binding (default) | binding
+        #[arg(long, default_value = "visible_not_binding")]
+        mode: String,
+    },
+    /// List the resolver modes Standing ships with.
+    ListModes,
 }
 
 #[derive(Subcommand)]
@@ -170,6 +211,7 @@ fn main() {
         Commands::Identity { action } => handle_identity(action),
         Commands::Grant { action } => handle_grant(&cli.db, action),
         Commands::Query { action } => handle_query(&cli.db, action),
+        Commands::Resolver { action } => handle_resolver(action),
     };
 
     if let Err(e) = result {
@@ -489,6 +531,81 @@ fn print_actor_from_evidence(evidence_str: &str) {
             }
         }
     }
+}
+
+fn handle_resolver(action: ResolverAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        ResolverAction::ListModes => {
+            // Mirror docs/remote-standing-boundary.md § "The four resolver modes".
+            println!("Standing ships four resolver modes (StandingResolver implementations):");
+            println!();
+            println!("  deny_all       refuses every request; panic-button / test scaffold");
+            println!("                 (consumer-facing name: DenyAllResolver)");
+            println!();
+            println!("  local_only     refuses any non-local actor; default for the");
+            println!("                 `private_local` exposure profile");
+            println!("                 (consumer-facing name: AllowLocalOnlyResolver)");
+            println!();
+            println!("  static_config  static (actor, claim_kind, subject_scope, audience)");
+            println!("                 allowlist from TOML; the MVP-enabling resolver");
+            println!("                 (consumer-facing name: StaticConfigResolver)");
+            println!();
+            println!("  store_grant    (post-MVP) defers to Standing's assertion-grant store;");
+            println!("                 real distributed-prod posture with grant lifecycle");
+            println!("                 (consumer-facing name: StandingToolResolver)");
+        }
+        ResolverAction::Test {
+            resolver,
+            config,
+            actor,
+            claim_kind,
+            subject_scope,
+            audience,
+            mode,
+        } => {
+            let mode = match mode.as_str() {
+                "binding" => ResolverMode::Binding,
+                "visible_not_binding" => ResolverMode::VisibleNotBinding,
+                other => {
+                    return Err(format!(
+                        "unknown mode {other:?}: expected `visible_not_binding` or `binding`"
+                    )
+                    .into());
+                }
+            };
+
+            let principal = Principal::new(actor.clone(), actor);
+            let request = StandingRequest::new(
+                principal,
+                claim_kind,
+                subject_scope,
+                audience,
+                chrono::Utc::now(),
+            )?;
+
+            let decision = match resolver.as_str() {
+                "deny_all" => DenyAllResolver::new(mode).assess(&request)?,
+                "local_only" => LocalOnlyResolver::new(mode).assess(&request)?,
+                "static_config" => {
+                    let path = config.ok_or_else(|| {
+                        "static_config resolver requires --config <path-to-toml>"
+                    })?;
+                    let cfg = StaticConfig::load(std::path::Path::new(&path))?;
+                    StaticConfigResolver::new(cfg, mode).assess(&request)?
+                }
+                other => {
+                    return Err(format!(
+                        "unknown resolver {other:?}: expected deny_all, local_only, static_config"
+                    )
+                    .into());
+                }
+            };
+
+            let json = serde_json::to_string_pretty(&decision)?;
+            println!("{json}");
+        }
+    }
+    Ok(())
 }
 
 fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::error::Error>> {

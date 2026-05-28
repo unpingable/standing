@@ -379,3 +379,310 @@ fn fresh_identity_after_replay_works() {
     assert!(ok);
     assert!(stdout.contains("granted"));
 }
+
+// ---------------------------------------------------------------
+// Resolver (entitlement-to-assert, remote-boundary entitlement seam)
+// ---------------------------------------------------------------
+
+fn example_config_path() -> String {
+    // CARGO_MANIFEST_DIR is crates/standing-cli; the example lives at
+    // <repo>/examples/static-config.toml.
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
+    p.pop();
+    p.push("examples");
+    p.push("static-config.toml");
+    p.to_str().unwrap().to_string()
+}
+
+fn parse_decision(stdout: &str) -> serde_json::Value {
+    serde_json::from_str(stdout).expect("resolver output must be canonical JSON")
+}
+
+#[test]
+fn resolver_list_modes_documents_all_four() {
+    let (ok, stdout, _) = run(standing().args(["resolver", "list-modes"]));
+    assert!(ok);
+    for mode in ["deny_all", "local_only", "static_config", "store_grant"] {
+        assert!(
+            stdout.contains(mode),
+            "resolver list-modes must mention {mode}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn resolver_deny_all_returns_denied() {
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "deny_all",
+        "--actor",
+        "workload:bot:host-a",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/foo",
+        "--audience",
+        "nq:main",
+    ]));
+    assert!(ok, "stdout: {stdout}");
+    let d = parse_decision(&stdout);
+    assert_eq!(d["verdict"], "denied");
+    assert_eq!(d["standing_basis"], "deny_default");
+    assert_eq!(d["standing_enforced"], false);
+    assert_eq!(d["resolver"], "DenyAllResolver");
+}
+
+#[test]
+fn resolver_deny_all_binding_mode_sets_enforced() {
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "deny_all",
+        "--actor",
+        "workload:bot:host-a",
+        "--claim-kind",
+        "k",
+        "--subject-scope",
+        "s",
+        "--audience",
+        "nq:main",
+        "--mode",
+        "binding",
+    ]));
+    assert!(ok);
+    let d = parse_decision(&stdout);
+    assert_eq!(d["standing_enforced"], true);
+}
+
+#[test]
+fn resolver_local_only_admits_workload_actor() {
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "local_only",
+        "--actor",
+        "workload:bot:host-a",
+        "--claim-kind",
+        "k",
+        "--subject-scope",
+        "s",
+        "--audience",
+        "nq:main",
+    ]));
+    assert!(ok);
+    let d = parse_decision(&stdout);
+    assert_eq!(d["verdict"], "allowed");
+    assert_eq!(d["resolver"], "LocalOnlyResolver");
+}
+
+#[test]
+fn resolver_local_only_refuses_component() {
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "local_only",
+        "--actor",
+        "component:nq:linode",
+        "--claim-kind",
+        "k",
+        "--subject-scope",
+        "s",
+        "--audience",
+        "nq:main",
+    ]));
+    assert!(ok);
+    let d = parse_decision(&stdout);
+    assert_eq!(d["verdict"], "denied");
+    assert_eq!(d["standing_basis"], "non_local_actor");
+}
+
+#[test]
+fn resolver_static_config_admits_each_nq_claim_kind() {
+    // The example config covers all four NQ Track-A claim kinds.
+    // Exercising each through the resolver is the MVP smoke test for
+    // Phase 3 (NQ visible-not-binding integration).
+    let cfg = example_config_path();
+    let cases = [
+        ("sqlite_wal_state", "labelwatch/foo"),
+        ("disk_state", "host:storage01"),
+        ("dns_state", "vantage:nq-linode/resolver:dns/example.com"),
+        ("ingest_state", "instance:nq:linode"),
+    ];
+    for (claim_kind, subject_scope) in cases {
+        let (ok, stdout, _) = run(standing().args([
+            "resolver",
+            "test",
+            "--resolver",
+            "static_config",
+            "--config",
+            &cfg,
+            "--actor",
+            "component:nq:linode",
+            "--claim-kind",
+            claim_kind,
+            "--subject-scope",
+            subject_scope,
+            "--audience",
+            "nq:main",
+        ]));
+        assert!(ok, "claim_kind={claim_kind}: stdout={stdout}");
+        let d = parse_decision(&stdout);
+        assert_eq!(
+            d["verdict"], "allowed",
+            "claim_kind={claim_kind} subject_scope={subject_scope} must match: {d:?}"
+        );
+        assert_eq!(d["resolver"], "StaticConfigResolver");
+        assert_eq!(d["standing_basis"], "static_config_match");
+    }
+}
+
+#[test]
+fn resolver_static_config_unknown_peer_denied() {
+    let cfg = example_config_path();
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "static_config",
+        "--config",
+        &cfg,
+        "--actor",
+        "component:nq:rogue",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/foo",
+        "--audience",
+        "nq:main",
+    ]));
+    assert!(ok);
+    let d = parse_decision(&stdout);
+    assert_eq!(d["verdict"], "denied");
+    assert_eq!(d["standing_basis"], "unknown_peer");
+}
+
+#[test]
+fn resolver_static_config_wrong_claim_kind_denied() {
+    let cfg = example_config_path();
+    // component:nq:sushi-k is configured for sqlite_wal_state + disk_state
+    // but NOT dns_state.
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "static_config",
+        "--config",
+        &cfg,
+        "--actor",
+        "component:nq:sushi-k",
+        "--claim-kind",
+        "dns_state",
+        "--subject-scope",
+        "vantage:foo",
+        "--audience",
+        "nq:main",
+    ]));
+    assert!(ok);
+    let d = parse_decision(&stdout);
+    assert_eq!(d["verdict"], "denied");
+    assert_eq!(d["standing_basis"], "claim_kind_out_of_scope");
+}
+
+#[test]
+fn resolver_static_config_wrong_audience_denied() {
+    let cfg = example_config_path();
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "static_config",
+        "--config",
+        &cfg,
+        "--actor",
+        "component:nq:linode",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/foo",
+        "--audience",
+        "nq:somewhere-else",
+    ]));
+    assert!(ok);
+    let d = parse_decision(&stdout);
+    assert_eq!(d["verdict"], "denied");
+    assert_eq!(d["standing_basis"], "audience_mismatch");
+}
+
+#[test]
+fn resolver_rejects_bare_audience() {
+    // Canonical-naming validation: audience must be instance-qualified.
+    let cfg = example_config_path();
+    let (ok, _, stderr) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "static_config",
+        "--config",
+        &cfg,
+        "--actor",
+        "component:nq:linode",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/foo",
+        "--audience",
+        "nq", // bare — not instance-qualified
+    ]));
+    assert!(!ok, "bare audience must be refused");
+    assert!(
+        stderr.contains("instance-qualified") || stderr.contains("audience"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn resolver_decision_records_full_attribution() {
+    // The receipt-attribution discipline named in
+    // docs/remote-standing-boundary.md requires every decision to carry
+    // standing_mode/verification_mode/identity_substrate/standing_enforced/
+    // resolver/standing_basis. Validate the CLI surfaces all of them.
+    let cfg = example_config_path();
+    let (ok, stdout, _) = run(standing().args([
+        "resolver",
+        "test",
+        "--resolver",
+        "static_config",
+        "--config",
+        &cfg,
+        "--actor",
+        "component:nq:linode",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/foo",
+        "--audience",
+        "nq:main",
+    ]));
+    assert!(ok);
+    let d = parse_decision(&stdout);
+    for field in [
+        "verdict",
+        "reason",
+        "verification_mode",
+        "identity_substrate",
+        "standing_enforced",
+        "resolver",
+        "standing_basis",
+        "scope",
+        "audience",
+        "evaluated_at",
+    ] {
+        assert!(d.get(field).is_some(), "missing attribution field {field}");
+    }
+}

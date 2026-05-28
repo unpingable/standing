@@ -1,0 +1,85 @@
+# StaticConfigResolver — example configuration
+#
+# Each [[entry]] declares one (actor, claim_kind, subject_scope, audience)
+# tuple that this resolver will allow. Anything not matched is refused.
+#
+# Matching semantics (see docs/remote-standing-boundary.md):
+#   actor          exact match on canonical principal id
+#   claim_kind     exact match
+#   subject_scope  exact OR trailing-* prefix on /-delimited path
+#                  ("labelwatch/*" matches "labelwatch/foo" and
+#                   "labelwatch/foo/bar", not "labelwatchx", not "labelwatch")
+#   audience       exact match; must be instance-qualified
+#                  ("nq:linode", not "nq")
+#
+# Canonical principal forms:
+#   component:<name>:<instance>    e.g. component:nq:linode
+#   human:<handle>                 e.g. human:jbeck
+#   workload:<name>:<location>     e.g. workload:deploy-bot:host-a
+#   system                         the system actor (slice-1 sweep, expiry)
+#
+# Optional expires_at (RFC 3339) bounds the entry's validity window.
+
+# ---------------------------------------------------------------------
+# NQ Track-A preflight claim kinds, as of 2026-05-27.
+# Source: ~/git/nq/crates/nq-core/src/preflight.rs
+# ---------------------------------------------------------------------
+
+# A remote NQ instance on the Linode host may assert sqlite_wal_state
+# observations for any labelwatch-prefixed subject to the main NQ
+# aggregator.
+[[entry]]
+actor = "component:nq:linode"
+claim_kind = "sqlite_wal_state"
+subject_scope = "labelwatch/*"
+audience = "nq:main"
+
+# Disk-state observations for a specific storage host.
+[[entry]]
+actor = "component:nq:linode"
+claim_kind = "disk_state"
+subject_scope = "host:storage01"
+audience = "nq:main"
+
+# DNS-state observations from a configured vantage host.
+[[entry]]
+actor = "component:nq:linode"
+claim_kind = "dns_state"
+subject_scope = "vantage:nq-linode/resolver:dns/*"
+audience = "nq:main"
+
+# Ingest pulse — NQ-instance-internal health that the aggregator wants
+# to surface across instances.
+[[entry]]
+actor = "component:nq:linode"
+claim_kind = "ingest_state"
+subject_scope = "instance:nq:linode"
+audience = "nq:main"
+
+# ---------------------------------------------------------------------
+# A second NQ instance (illustrative). Same claim_kinds, different
+# subject_scope and same audience.
+# ---------------------------------------------------------------------
+
+[[entry]]
+actor = "component:nq:sushi-k"
+claim_kind = "sqlite_wal_state"
+subject_scope = "labelwatch/*"
+audience = "nq:main"
+
+[[entry]]
+actor = "component:nq:sushi-k"
+claim_kind = "disk_state"
+subject_scope = "host:sushi-k"
+audience = "nq:main"
+
+# ---------------------------------------------------------------------
+# A bounded-window entry: a one-day debugging grant.
+# ---------------------------------------------------------------------
+
+[[entry]]
+actor = "human:jbeck"
+claim_kind = "sqlite_wal_state"
+subject_scope = "labelwatch/*"
+audience = "nq:main"
+expires_at = "2026-05-28T00:00:00Z"

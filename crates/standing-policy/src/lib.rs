@@ -2,6 +2,18 @@
 //!
 //! Evaluates grant requests against policy and emits decision receipts.
 //! Hardcoded policy for slice 1; trait-based for future pluggability.
+//!
+//! Also hosts the remote-boundary entitlement seam (`resolver` module) —
+//! see `docs/remote-standing-boundary.md`.
+
+pub mod config;
+pub mod resolver;
+
+pub use config::{MatchOutcome, MismatchReason, StaticConfig, StaticConfigEntry};
+pub use resolver::{
+    basis, DenyAllResolver, LocalOnlyResolver, ResolveError, ResolverMode, StandingDecision,
+    StandingRequest, StandingResolver, StandingVerdict, StaticConfigResolver,
+};
 
 use sha2::{Digest, Sha256};
 use standing_grant::GrantRequest;
