@@ -586,6 +586,51 @@ Standing's role across this set: speaker / requester entitlement, with `Standing
 
 Any one of those gates Phase 4 by itself; the four together raise the priority but do not change the discipline. Standing waits for a concrete consumer to knock before building.
 
+## Formal substrate alignment
+
+The advisory-vs-binding distinction, the freshness verdict family, and the separation between speaker/requester standing and mutation-side admissibility are now mirrored in a Lean admissibility kernel that names Standing as a canonical runtime consumer. The mapping is alignment vocabulary, not an implementation claim.
+
+```text
+Lean module / concept                  Standing operational counterpart
+─────────────────────────────────────  ────────────────────────────────────
+Freshness.lean (negative theorems)     AssessmentResult verdicts:
+  expired_not_fresh                      Expired
+  not_yet_valid_not_fresh                NotYetValid
+  incoherent_not_fresh /
+    not_precedes_not_fresh /             AssessmentCompromised
+    divergence_excessive_not_fresh
+Freshness.lean (Fresh predicate)       slice-1 identity verification:
+  TemporallyCoherent                     issued precedes expires
+  DivergenceAcceptable                   max_clock_skew (30s default)
+  WithinValidity                         now ∈ skewed validity window
+
+Authority.BasisVerdict                 ResolverMode:
+  advisoryBasis                          VisibleNotBinding
+  admissibleBasis                        Binding
+  noBasis                                no analogue at the mode layer;
+                                         expressed at decision-time as
+                                         Denied / Unknown
+
+Execution.AuthorizedStep               Standing + Wicket co-required:
+  StepAllowed (mutation standing)        Wicket-owned (operation-phase)
+  authorityAuthorized (verdict green)    Standing-owned (speaker/requester)
+
+WitnessInvariance                      witness-stability primitive named
+                                       in the consumer list alongside NQ,
+                                       Continuity, Custody, Governor
+
+Safety-bridge family (Frontier 1)      keeper: standing-to-assert ≠
+  bridge_implies_safe via preserves    claim true. Authorisation is a
+  authorization ≠ defended-value       declaration; preservation must be
+    preservation                         witnessed.
+```
+
+**The Lean modules are cited as formal substrate / alignment points for the doctrine, not as runtime conformance evidence.** Standing remains an operational boundary in Rust; the kernel remains a formal-methods artifact in Lean. Standing did not build for the kernel — Standing's existing runtime is the forcing receipt that made `Freshness.lean` and `WitnessInvariance.lean` non-decorative. The kernel modules name Standing in their docstrings; Standing carries no Lean-conformance code, no derived types, no proof obligations.
+
+Family resemblance is not custody. Allowed phrasing in this doc and downstream is *aligns with*, *cites as formal substrate*, *has a Lean counterpart*. Refused phrasing is *implements*, *formally verified*, *Lean-backed*, *conforms to*. The distinction is binding because the alternative is a future doc claiming "formally verified Standing" and the operator having to drive it to the river.
+
+The Frontier-1 safety-bridge family is the structural articulation of this document's existing keeper: *authorization does not entail truth, safety, or preservation*. Standing can assert that an actor has admissible basis / standing-to-speak; it does not make the claim true. NQ still decides what the evidence can testify to; Wicket still preflights action admissibility; Nightshift still decides posture; the bridge to defended-value preservation is a separate predicate, not a corollary.
+
 ## Relationship to existing Standing docs
 
 - `README.md` — names entitlement-to-act as current, entitlement-to-assert as roadmap. This document is the entrance of that roadmap.
@@ -630,3 +675,5 @@ Filed 2026-05-27 as Standing's local manifestation of `~/git/cartography/coordin
 Two review passes incorporated 2026-05-27: ChatGPT roadmap nits (phase numbering, MVP scope reduced to resolver+StaticConfig, lease-shaped not action-shaped, explicit `standing_enforced` receipt fields, ingestion-vs-claim-authority distinction, scope matching semantics, softened forward-compat claims) and a Kerberos-scars amendment set (grant-vs-request-proof split, canonical principal/audience naming, replay cache per audience, delegation-denied default, TTL-first revocation, keytab doctrine, clock-skew doctrine, authorization-data-is-not-truth, realm/federation explicitly unsupported, Kerberos-lineage-not-mechanism non-goal).
 
 Paper-only reconciliation 2026-05-28 against sibling filings that landed between Standing's MVP commit and the next operator session: NQ-NS bilateral channel-split spike, SELF-SUBJECT-COLLAPSE shared gap, Wicket's `WICKET_REMOTE_STANDING_ADAPTER_GAP.md`, WLP's two cross-references, NQ's `NQ_NS_CHANNEL_SPLIT_NQ_SIDE.md`. Vocabulary discipline added: `subject_id` vs `subject_scope` distinction, axes (truth/posture/ack) recognised as sibling-owned, action-classes enumerated as imported/provisional, `component-testimony-subscription` recognised as an action-class **not** an axis, subscription/emission directional inversion named as a deferred design question, producer-side time fields named as deferred. Phase 4 forcing pressures updated to four. No code changed; no sibling repo artifacts edited from Standing.
+
+Paper-only reconciliation 2026-06-03 against the Lean admissibility kernel (`~/git/lean`, Admissibility Calculus 1.0 tagged 2026-05-24, sorry-free 2026-05-28, safety-axis gates closed 2026-05-29), which names Standing as canonical consumer of `Freshness.lean` and lists Standing in `WitnessInvariance.lean`'s consumer set. Added "Formal substrate alignment" section mapping `AssessmentResult` → Freshness verdicts, `ResolverMode` → `Authority.BasisVerdict`, Standing-plus-Wicket → `Execution.AuthorizedStep`, with the explicit guardrail that this is alignment vocabulary, not an implementation claim. Refused phrasing pinned: never "implements / formally verified / Lean-backed / conforms to". No code changed; no Lean artifacts edited from Standing.
