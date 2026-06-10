@@ -2,8 +2,9 @@ use clap::{Parser, Subcommand};
 use standing_grant::{ActorContext, GrantMachine, GrantRequest, GrantScope, Principal};
 use standing_identity::{WorkloadId, verify_and_resolve, verify_and_resolve_with_replay, CreateOptions, ReplayGuard, VerifyOptions};
 use standing_policy::{
-    DenyAllResolver, HardcodedPolicy, LocalOnlyResolver, PolicyEvaluator, ResolverMode,
-    StandingRequest, StandingResolver, StaticConfig, StaticConfigResolver, Verdict,
+    check_assert, AssertCheckRequest, DenyAllResolver, EffectClass, HardcodedPolicy,
+    LocalOnlyResolver, PolicyEvaluator, ResolverMode, StandingRequest, StandingResolver,
+    StaticConfig, StaticConfigResolver, Verdict,
 };
 use standing_store::{GrantMeta, Store};
 
@@ -46,6 +47,36 @@ enum Commands {
     Genesis {
         #[command(subcommand)]
         action: GenesisAction,
+    },
+    /// Assertion-standing preflight surface (Phase 4a — door, not room).
+    /// Consumers ask "do I need assert-standing for this effect?" and get
+    /// a structured answer. Does not authorize. See docs/remote-standing-boundary.md.
+    Assert {
+        #[command(subcommand)]
+        action: AssertAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AssertAction {
+    /// Preflight check: would this operation require assert-standing,
+    /// and if so, can Standing supply it? Pure inquiry; no state change.
+    Check {
+        /// Canonical principal id of the asking actor
+        #[arg(long)]
+        principal: String,
+        /// Instance-qualified consumer name (e.g. "nq:linode")
+        #[arg(long)]
+        consumer: String,
+        /// Claim kind being asserted (e.g. "sqlite_wal_state")
+        #[arg(long, name = "claim-kind")]
+        claim_kind: String,
+        /// Resource the claim is about
+        #[arg(long)]
+        target: String,
+        /// Effect class: descriptive | advisory | binding | mutating
+        #[arg(long)]
+        effect: String,
     },
 }
 
@@ -240,6 +271,7 @@ fn main() {
         Commands::Query { action } => handle_query(&cli.db, action),
         Commands::Resolver { action } => handle_resolver(action),
         Commands::Genesis { action } => handle_genesis(&cli.db, action),
+        Commands::Assert { action } => handle_assert(&cli.db, action),
     };
 
     if let Err(e) = result {
@@ -861,6 +893,50 @@ fn handle_genesis(
                     Ok(())
                 }
             }
+        }
+    }
+}
+
+fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        AssertAction::Check {
+            principal,
+            consumer,
+            claim_kind,
+            target,
+            effect,
+        } => {
+            let effect = match effect.as_str() {
+                "descriptive" => EffectClass::Descriptive,
+                "advisory" => EffectClass::Advisory,
+                "binding" => EffectClass::Binding,
+                "mutating" => EffectClass::Mutating,
+                other => {
+                    return Err(format!(
+                        "unknown effect: {other:?} (expected: descriptive | advisory | binding | mutating)"
+                    )
+                    .into());
+                }
+            };
+
+            let request = AssertCheckRequest::new(
+                &principal,
+                &consumer,
+                &claim_kind,
+                &target,
+                effect,
+            )?;
+
+            // Pull genesis + policy citation from the store so the answer
+            // is grounded in the instance's actual authority context.
+            let store = Store::open(db_path)?;
+            let genesis = store.get_genesis()?;
+            let genesis_digest = genesis.as_ref().map(|g| g.digest.as_str());
+            let policy_hash = genesis.as_ref().and_then(|g| g.policy_hash.as_deref());
+
+            let result = check_assert(&request, genesis_digest, policy_hash);
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
         }
     }
 }

@@ -7,9 +7,14 @@
 //! see `docs/remote-standing-boundary.md`.
 
 pub mod config;
+pub mod preflight;
 pub mod resolver;
 
 pub use config::{MatchOutcome, MismatchReason, StaticConfig, StaticConfigEntry};
+pub use preflight::{
+    assert_basis, check_assert, AssertCheckDecision, AssertCheckRequest, AssertCheckResult,
+    AssertCheckWhy, EffectClass,
+};
 pub use resolver::{
     basis, DenyAllResolver, LocalOnlyResolver, ResolveError, ResolverMode, StandingDecision,
     StandingRequest, StandingResolver, StandingVerdict, StaticConfigResolver,

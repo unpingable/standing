@@ -285,6 +285,91 @@ Same word, different axis. The tax is paid in documentation.
 
 When the consumer-integration phase has a real plant, Wicket will likely grow a separate field — tentatively `Intent.caller_assertion_standing` — that carries Standing's output without collapsing it into the operation-role ladder. Naming finalized when the bridge has traffic, not before. **The bridge stays unbuilt until then.**
 
+## Phase 4a — assertion-standing preflight surface (the door)
+
+The `AssertionGrant` lease lifecycle (Phase 4b) is consumer-gated and not yet built. But a consumer cannot present a clean forcing case for the lifecycle if Standing has no door for them to knock on. Phase 4a is that door.
+
+> The assertion-standing inquiry surface is freeze-safe under operator fiat because it does not authorize assertion. It makes absence observable.
+
+A consumer about to bind or mutate downstream state calls:
+
+```
+standing assert check \
+  --principal <canonical-principal> \
+  --consumer <name:instance> \
+  --claim-kind <kind> \
+  --target <resource> \
+  --effect <descriptive|advisory|binding|mutating>
+```
+
+and receives a structured `AssertCheckResult`:
+
+```json
+{
+  "decision": "required_not_implemented",
+  "reason": "assertion_standing_not_implemented",
+  "required_for": "binding_claim",
+  "act_standing_sufficient": false,
+  "assert_standing_required": true,
+  "why": {
+    "genesis": "<digest, if installed>",
+    "policy": "<hash, if installed>",
+    "note": "Standing has no AssertionGrant lease lifecycle installed (Phase 4b)..."
+  },
+  "consumer": "wicket:local",
+  "claim_kind": "deploy_authorization"
+}
+```
+
+### EffectClass — consumer-declared, not Standing-inferred
+
+```text
+descriptive   pure observation; act-standing sufficient
+advisory      information-only; act-standing sufficient
+binding       downstream treats as authoritative; assert-standing required
+mutating      consumer mutates state on this basis; assert-standing required
+```
+
+**Effect class is consumer-declared.** Standing does not infer it from `claim_kind`. Mis-declaring the effect class is the consumer's failure to refuse — Standing cannot defend against `"this is descriptive, I promise"` when downstream binds on it. The check surface gives the consumer the labeled door; the consumer chooses which door to knock on.
+
+### What Phase 4a is NOT
+
+```text
+- Not minting any AssertionGrant
+- Not persisting check results (preflight is pure inquiry)
+- Not emitting receipts on check (no state transition)
+- Not authorizing anything
+
+The check does not dissolve the freeze on lease lifecycle work. It
+preserves the freeze in a form consumers can actually hit.
+```
+
+### The forcing-case detector
+
+A consumer that calls `assert check` for a binding effect and receives `RequiredNotImplemented` has the citable forcing case Phase 4b needs:
+
+> "I am about to bind claim X. Standing says: yes, you need assert-standing, and none exists."
+
+That receipt — the structured refusal — is the wedge into Phase 4b. Without the door, consumers would have to invent Standing's missing interface, which is backwards.
+
+### Decision variants
+
+Phase 4a ships two:
+
+```text
+NotRequired              effect is descriptive/advisory
+RequiredNotImplemented   effect is binding/mutating; no lifecycle yet
+```
+
+Phase 4b will add:
+
+```text
+RequiredAndAvailable     grant exists, scope matches, fresh, audience-aligned
+RequiredButDenied        grant exists but the request falls outside it
+```
+
+**Consumers MUST treat unknown decision variants as conservative refusal.** New variants are additive; old code defaults to "do not bind."
+
 ## The four resolver modes (the pluggable seam)
 
 Components **must not hard-link** to Standing-the-tool as a mandatory dependency.
@@ -717,3 +802,7 @@ Paper-only reconciliation 2026-05-28 against sibling filings that landed between
 Paper-only reconciliation 2026-06-03 against the Lean admissibility kernel (`~/git/lean`, Admissibility Calculus 1.0 tagged 2026-05-24, sorry-free 2026-05-28, safety-axis gates closed 2026-05-29), which names Standing as canonical consumer of `Freshness.lean` and lists Standing in `WitnessInvariance.lean`'s consumer set. Added "Formal substrate alignment" section mapping `AssessmentResult` → Freshness verdicts, `ResolverMode` → `Authority.BasisVerdict`, Standing-plus-Wicket → `Execution.AuthorizedStep`, with the explicit guardrail that this is alignment vocabulary, not an implementation claim. Refused phrasing pinned: never "implements / formally verified / Lean-backed / conforms to". No code changed; no Lean artifacts edited from Standing.
 
 Doctrine pass 2026-06-10 from a Claude Fable review (operator-relayed) plus follow-up cadence amendments. Added "Named invariants" block (state-not-cargo, model-not-principal, no-cache-without-lease, reverify-every-gate, substrate-strength), folded into the README as well. Filed two candidate specs (`docs/genesis-receipt.md` for the chain-termination gap, `docs/lifecycle-freeze.md` for the missing incident-mode lifecycle verb) — both `candidate / non-binding`, naming the shape pre-cooked so the next forcing event does not have to invent it under pressure. Refined Phase 4 forcing trigger as "binding actuation" — the unifying event behind the four named pressures, sharper than "consumer flips." No code changed.
+
+Genesis MVP landed 2026-06-10. `ReceiptKind::GenesisInstall`, `Store::install_genesis` / `Store::get_genesis`, `standing genesis install/show` verbs, `query why` footer. SQLite partial unique index enforces exactly-one-per-instance. Cryptographic parent-linkage of grant receipts to genesis deferred until a forcing event names it.
+
+Phase 4a landed 2026-06-10 under incoming NQ-Gov-Wicket demo pressure. Built the assertion-standing preflight/refusal door (`standing assert check`, `AssertCheckRequest`/`Result`, `EffectClass`, `check_assert`) without the room: no `AssertionGrant` minting, no lease, no persistence, no delegation. Freeze on lifecycle work preserved; the door is what consumers can knock on while the room stays unbuilt. Two decision variants (NotRequired, RequiredNotImplemented); the structured refusal IS the forcing-case detector for Phase 4b.

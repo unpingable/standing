@@ -197,7 +197,7 @@ pub mod basis {
 
 /// Audience must be instance-qualified: `<name>:<instance>` where both
 /// segments are non-empty and contain no `:`.
-fn validate_audience(audience: &str) -> Result<(), ResolveError> {
+pub(crate) fn validate_audience(audience: &str) -> Result<(), ResolveError> {
     let mut parts = audience.splitn(2, ':');
     let name = parts.next().unwrap_or("");
     let instance = parts.next().unwrap_or("");
@@ -217,7 +217,7 @@ fn validate_audience(audience: &str) -> Result<(), ResolveError> {
 ///
 /// The slice-1 `wl:<name>:<location>` form is also accepted as an alias
 /// of `workload:` — slice-1 receipts and tests use the short prefix.
-fn validate_principal(id: &str) -> Result<(), ResolveError> {
+pub(crate) fn validate_principal(id: &str) -> Result<(), ResolveError> {
     if id == "system" {
         return Ok(());
     }

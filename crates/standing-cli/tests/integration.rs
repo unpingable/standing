@@ -866,3 +866,180 @@ fn query_why_footers_silence_when_no_genesis() {
     assert!(stdout.contains("chain terminates in silence"));
     assert!(stdout.contains("standing genesis install"));
 }
+
+// ---------------------------------------------------------------
+// Assertion-standing preflight surface (Phase 4a — door, not room)
+// ---------------------------------------------------------------
+
+#[test]
+fn assert_check_descriptive_does_not_require() {
+    let db = temp_db();
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nq:linode",
+        "--consumer", "nq:linode",
+        "--claim-kind", "sqlite_wal_state",
+        "--target", "labelwatch/foo",
+        "--effect", "descriptive",
+    ]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["decision"], "not_required");
+    assert_eq!(v["reason"], "effect_non_binding");
+    assert_eq!(v["act_standing_sufficient"], true);
+    assert_eq!(v["assert_standing_required"], false);
+    assert!(v["required_for"].is_null());
+    assert_eq!(v["consumer"], "nq:linode");
+    assert_eq!(v["claim_kind"], "sqlite_wal_state");
+}
+
+#[test]
+fn assert_check_advisory_does_not_require() {
+    let db = temp_db();
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nq:linode",
+        "--consumer", "wicket:local",
+        "--claim-kind", "host_state",
+        "--target", "host:storage01",
+        "--effect", "advisory",
+    ]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["decision"], "not_required");
+    assert_eq!(v["assert_standing_required"], false);
+}
+
+#[test]
+fn assert_check_binding_refused_as_not_implemented() {
+    let db = temp_db();
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nq:linode",
+        "--consumer", "wicket:local",
+        "--claim-kind", "deploy_authorization",
+        "--target", "prod/web-api",
+        "--effect", "binding",
+    ]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["decision"], "required_not_implemented");
+    assert_eq!(v["reason"], "assertion_standing_not_implemented");
+    assert_eq!(v["required_for"], "binding_claim");
+    assert_eq!(v["act_standing_sufficient"], false);
+    assert_eq!(v["assert_standing_required"], true);
+}
+
+#[test]
+fn assert_check_mutating_refused_as_not_implemented() {
+    let db = temp_db();
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nightshift:sushi-k",
+        "--consumer", "ag:local",
+        "--claim-kind", "watchbill_close",
+        "--target", "wb-42",
+        "--effect", "mutating",
+    ]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["decision"], "required_not_implemented");
+    assert_eq!(v["required_for"], "mutating_claim");
+}
+
+#[test]
+fn assert_check_cites_genesis_when_installed() {
+    let db = temp_db();
+    let id_file = temp_identity("jbeck", "laptop", SECRET);
+
+    // Install genesis first.
+    let (ok, _, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "genesis", "install",
+        "--identity", id_file.path().to_str().unwrap(),
+        "--secret", SECRET,
+    ]));
+    assert!(ok);
+
+    // Now check assert; result should cite genesis digest + policy hash.
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nq:linode",
+        "--consumer", "wicket:local",
+        "--claim-kind", "deploy",
+        "--target", "prod/web-api",
+        "--effect", "binding",
+    ]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        v["why"]["genesis"].as_str().is_some(),
+        "why.genesis must cite digest when genesis is installed: {v}"
+    );
+    assert!(
+        v["why"]["policy"].as_str().is_some(),
+        "why.policy must cite hash when genesis is installed: {v}"
+    );
+}
+
+#[test]
+fn assert_check_silent_when_no_genesis() {
+    let db = temp_db();
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nq:linode",
+        "--consumer", "wicket:local",
+        "--claim-kind", "deploy",
+        "--target", "prod/web-api",
+        "--effect", "binding",
+    ]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(v["why"]["genesis"].is_null());
+    assert!(v["why"]["policy"].is_null());
+    assert!(
+        v["why"]["note"].as_str().is_some_and(|n| !n.is_empty()),
+        "why.note must always carry operator-readable text"
+    );
+}
+
+#[test]
+fn assert_check_rejects_bare_consumer_name() {
+    let db = temp_db();
+    let (ok, _, stderr) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nq:linode",
+        "--consumer", "nq",
+        "--claim-kind", "sqlite_wal_state",
+        "--target", "labelwatch/foo",
+        "--effect", "descriptive",
+    ]));
+    assert!(!ok, "bare consumer name must be refused");
+    assert!(
+        stderr.contains("audience") || stderr.contains("instance"),
+        "stderr should explain canonicalization failure: {stderr}"
+    );
+}
+
+#[test]
+fn assert_check_rejects_unknown_effect() {
+    let db = temp_db();
+    let (ok, _, stderr) = run(standing().args([
+        "--db", db.path().to_str().unwrap(),
+        "assert", "check",
+        "--principal", "component:nq:linode",
+        "--consumer", "nq:linode",
+        "--claim-kind", "sqlite_wal_state",
+        "--target", "labelwatch/foo",
+        "--effect", "binding-ish",
+    ]));
+    assert!(!ok);
+    assert!(stderr.contains("unknown effect"), "stderr was: {stderr}");
+}

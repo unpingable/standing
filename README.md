@@ -98,6 +98,13 @@ standing query chain --id <grant-id>
 
 # Sweep expired grants (system actor)
 standing grant sweep
+
+# Phase 4a — assertion-standing preflight (door, not room).
+# Consumer asks "do I need assert-standing for this effect?"
+standing assert check \
+  --principal component:nq:linode --consumer wicket:local \
+  --claim-kind deploy_authorization --target prod/web-api \
+  --effect binding
 ```
 
 ## Architecture
