@@ -14,6 +14,33 @@ Standing does not implement Kerberos-style ticket transport. Grants are recorded
 
 Current Standing models **entitlement-to-act**: whether an actor may perform an operation against a target. Agentic systems also expose a neighboring need, **entitlement-to-assert**, where the relevant object is a claim that may affect downstream consequence. That surface is roadmap only; its schema and receipt format are not yet designed.
 
+## Invariants
+
+```text
+Standing is state, not cargo.
+  A grant identifier is not authority. Authority is determined
+  only by fresh verification against the authoritative standing
+  store. The contrast Standing names is authoritative online
+  verification vs portable self-sufficient legitimacy — JWTs,
+  tickets, and macaroons are formats of the latter class
+  whenever the verifier treats possession as sufficient.
+
+Model is not principal.
+  Models propose. Workloads invoke. Standing attaches to
+  workloads and operators, never to models. Model identity is
+  attribution; workload identity is authority.
+
+No standing cache without explicit lease doctrine.
+  Caching standing decisions for availability reintroduces
+  bearer legitimacy unless the cache is itself governed as
+  an explicit lease with bounded consequence.
+
+Re-verify at every consequence-bearing gate.
+  Standing is not checked once per run. It is checked at
+  admission, at capacity / token consumption, at packet
+  emission, at every later mutation gate.
+```
+
 ## What it does
 
 - Tracks grant lifecycles: request, issue/deny, activate, use, expire, revoke, abandon
@@ -86,6 +113,12 @@ deploy-bot ──request──> [policy engine] ──decision receipt──> [g
 ```
 
 Receipt format: canonical JSON (RFC 8785 / JCS) + SHA-256. WLP-compatible.
+
+## Limitations
+
+The fail-closed chain is only as strong as the identity substrate beneath it. Slice-1 Standing verifies workload identity via HMAC over a shared secret per principal. That is a named limit, not a placeholder for inherited PKI rigor — receipts inherit the cryptographic strength of the substrate, not more. Upgrading the substrate (mTLS, OIDC, SPIFFE) is a separate decision with its own forcing case; `docs/identity-substrate-gap.md` is the roadmap home.
+
+Standing is also a single point of authority by design. Authority unreachable means fail-closed means nothing acts. For consequence-bearing operations that is the correct polarity. A future proposal to "cache standing decisions for resilience" is the bearer-token failure mode sneaking back in through the availability door, and is refused by the no-cache-without-lease invariant above.
 
 ## License
 

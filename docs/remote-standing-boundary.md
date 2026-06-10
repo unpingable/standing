@@ -20,6 +20,44 @@ That is **entitlement-to-assert** (or entitlement-to-request) — structurally d
 
 Identity proves who spoke. Standing decides whether that speaker had the right to speak in that role.
 
+## Named invariants
+
+```text
+Standing is state, not cargo.
+  A grant identifier is not authority. Authority is determined only
+  by fresh verification against the authoritative standing store.
+  The contrast is authoritative online verification vs portable
+  self-sufficient legitimacy. JWTs, tickets, macaroons are formats
+  of the latter class whenever the verifier treats possession as
+  sufficient.
+
+Model is not principal.
+  Models propose. Workloads invoke. Standing attaches to workloads
+  and operators, never to models. Provenance reads "proposed by
+  model M, invoked under grant G held by workload W" — never "model
+  M had standing."
+
+No standing cache without explicit lease doctrine.
+  Caching standing decisions for availability reintroduces bearer
+  legitimacy unless the cache is itself governed as an explicit
+  lease with bounded consequence.
+
+Re-verify at every consequence-bearing gate.
+  Standing is checked at admission, at capacity, at packet
+  emission, at every later mutation gate. Not once per run.
+  Slice-1 grant-use already re-reads state at use; the rule
+  generalises.
+
+The fail-closed chain is only as strong as the identity
+substrate beneath it.
+  Receipts inherit the cryptographic strength of the substrate,
+  not more. The slice-1 HMAC workload identity is a named limit.
+  Upgrading the substrate is a separate decision with its own
+  forcing case.
+```
+
+These name structural properties slice-1 Standing already obeys. The doc writes them down so future agents cannot propose violations under hygiene arguments — "give the model its own identity for cleanliness," "cache decisions for resilience," "skip re-verification since we already checked at admission." All three of those proposals fail a named invariant by name.
+
 ## The five layers a remote-surface design must distinguish
 
 ```text
@@ -677,3 +715,5 @@ Two review passes incorporated 2026-05-27: ChatGPT roadmap nits (phase numbering
 Paper-only reconciliation 2026-05-28 against sibling filings that landed between Standing's MVP commit and the next operator session: NQ-NS bilateral channel-split spike, SELF-SUBJECT-COLLAPSE shared gap, Wicket's `WICKET_REMOTE_STANDING_ADAPTER_GAP.md`, WLP's two cross-references, NQ's `NQ_NS_CHANNEL_SPLIT_NQ_SIDE.md`. Vocabulary discipline added: `subject_id` vs `subject_scope` distinction, axes (truth/posture/ack) recognised as sibling-owned, action-classes enumerated as imported/provisional, `component-testimony-subscription` recognised as an action-class **not** an axis, subscription/emission directional inversion named as a deferred design question, producer-side time fields named as deferred. Phase 4 forcing pressures updated to four. No code changed; no sibling repo artifacts edited from Standing.
 
 Paper-only reconciliation 2026-06-03 against the Lean admissibility kernel (`~/git/lean`, Admissibility Calculus 1.0 tagged 2026-05-24, sorry-free 2026-05-28, safety-axis gates closed 2026-05-29), which names Standing as canonical consumer of `Freshness.lean` and lists Standing in `WitnessInvariance.lean`'s consumer set. Added "Formal substrate alignment" section mapping `AssessmentResult` → Freshness verdicts, `ResolverMode` → `Authority.BasisVerdict`, Standing-plus-Wicket → `Execution.AuthorizedStep`, with the explicit guardrail that this is alignment vocabulary, not an implementation claim. Refused phrasing pinned: never "implements / formally verified / Lean-backed / conforms to". No code changed; no Lean artifacts edited from Standing.
+
+Doctrine pass 2026-06-10 from a Claude Fable review (operator-relayed) plus follow-up cadence amendments. Added "Named invariants" block (state-not-cargo, model-not-principal, no-cache-without-lease, reverify-every-gate, substrate-strength), folded into the README as well. Filed two candidate specs (`docs/genesis-receipt.md` for the chain-termination gap, `docs/lifecycle-freeze.md` for the missing incident-mode lifecycle verb) — both `candidate / non-binding`, naming the shape pre-cooked so the next forcing event does not have to invent it under pressure. Refined Phase 4 forcing trigger as "binding actuation" — the unifying event behind the four named pressures, sharper than "consumer flips." No code changed.
