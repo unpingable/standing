@@ -696,9 +696,11 @@ name = "standing-store"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "standing-grant",
  "standing-identity",
  "standing-receipt",

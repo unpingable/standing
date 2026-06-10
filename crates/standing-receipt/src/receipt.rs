@@ -28,6 +28,11 @@ pub enum ReceiptKind {
     GrantAbandoned,
     /// A policy decision was made
     PolicyDecision,
+    /// The root of this Standing instance's receipt chain: the operator's
+    /// citable fiat establishing initial policy. Exactly one per instance.
+    /// `parent_digest` is always None; this is the named genesis the chain
+    /// terminates at. See `docs/genesis-receipt.md`.
+    GenesisInstall,
 }
 
 /// A receipt: content-addressed witness to an event.

@@ -77,6 +77,10 @@ cargo test
 # Create a verified workload identity
 standing identity create --name deploy-bot --location host-abc --secret my-key > bot.id.json
 
+# Name the chain root: operator-fiat genesis. Exactly one per instance.
+standing identity create --name operator --location laptop --secret my-key > op.id.json
+standing genesis install --identity op.id.json --secret my-key
+
 # Request a grant (identity verified, policy evaluates, issues or denies)
 standing grant request --identity bot.id.json --secret my-key \
   --action deploy --target prod/web-api --duration 300

@@ -11,6 +11,7 @@ pub mod replay;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Transaction};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use standing_grant::{ActorContext, GrantState, PrincipalRole, auth};
@@ -46,6 +47,9 @@ pub enum StoreError {
         role: String,
         transition: String,
     },
+
+    #[error("genesis already installed for this instance (digest {0}); a second install would contradict the chain root")]
+    GenesisExists(String),
 }
 
 /// The standing store.
@@ -112,9 +116,91 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_grants_subject_id ON grants(subject_id);
             CREATE INDEX IF NOT EXISTS idx_grants_actor ON grants(actor);
             CREATE INDEX IF NOT EXISTS idx_grants_state ON grants(state);
+
+            -- Genesis is the chain root: exactly one per Standing instance.
+            -- A second install would contradict the invariant 'this instance
+            -- was established by this operator on this date under this policy.'
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_genesis
+                ON receipts(kind) WHERE kind = 'genesis_install';
             ",
         )?;
         Ok(())
+    }
+
+    /// Install the genesis receipt for this Standing instance.
+    ///
+    /// The genesis is the named root of the receipt chain: an operator's
+    /// citable fiat establishing initial policy. `basis = "operator_fiat"`,
+    /// `prior_grant = null`, `parent_digest = None`. Exactly one per instance
+    /// — a second install returns `GenesisExists`.
+    ///
+    /// Returns the genesis receipt on success. See `docs/genesis-receipt.md`.
+    pub fn install_genesis(
+        &mut self,
+        operator: &str,
+        policy_source: &str,
+    ) -> Result<Receipt, StoreError> {
+        if let Some(existing) = self.get_genesis()? {
+            return Err(StoreError::GenesisExists(existing.digest));
+        }
+
+        // MVP: hash the policy_source string as the canonical policy identifier.
+        // For HardcodedPolicy this is the version marker itself. For external
+        // policy artifacts (post-MVP) the source should be the canonical file
+        // bytes; the spec at docs/genesis-receipt.md names that future shape.
+        let policy_hash = hex::encode(Sha256::digest(policy_source.as_bytes()));
+
+        let instance_id = Uuid::new_v4();
+        let evidence = serde_json::json!({
+            "version": "standing.genesis.v1",
+            "basis": "operator_fiat",
+            "prior_grant": serde_json::Value::Null,
+            "policy_source": policy_source,
+            "instance_id": instance_id.to_string(),
+            "claim": "Operator establishes initial Standing policy by explicit fiat. \
+                      No prior grant authorises this; the operator is the genesis \
+                      authority of this Standing instance.",
+        });
+
+        let receipt = ReceiptBuilder::new(
+            ReceiptKind::GenesisInstall,
+            operator,
+            instance_id.to_string(),
+        )
+        .evidence(evidence)
+        .policy_hash(&policy_hash)
+        .build()?;
+
+        let tx = self.conn.transaction()?;
+        insert_receipt(&tx, &receipt)?;
+        tx.commit()?;
+
+        Ok(receipt)
+    }
+
+    /// Get this instance's genesis receipt, if one has been installed.
+    pub fn get_genesis(&self) -> Result<Option<ReceiptRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT digest, id, kind, timestamp, actor, subject, parent_digest, evidence, policy_hash
+             FROM receipts WHERE kind = 'genesis_install' LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([], |row| {
+            Ok(ReceiptRow {
+                digest: row.get(0)?,
+                id: row.get(1)?,
+                kind: row.get(2)?,
+                timestamp: row.get(3)?,
+                actor: row.get(4)?,
+                subject: row.get(5)?,
+                parent_digest: row.get(6)?,
+                evidence: row.get(7)?,
+                policy_hash: row.get(8)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     /// Low-level: store a receipt and update grant state atomically.
@@ -966,5 +1052,87 @@ mod tests {
         assert_eq!(evidence["actor"]["principal_id"], SUBJECT_ID);
         assert_eq!(evidence["subject_id"], SUBJECT_ID);
         assert_eq!(evidence["actor"]["role"], "subject");
+    }
+
+    // ---------------------------------------------------------------
+    // Genesis receipt — chain-root for the receipt invariant
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn genesis_install_succeeds_and_is_retrievable() {
+        let mut store = Store::in_memory().unwrap();
+
+        let r = store
+            .install_genesis("workload:jbeck:laptop", "hardcoded:v1")
+            .unwrap();
+
+        assert_eq!(r.kind, ReceiptKind::GenesisInstall);
+        assert_eq!(r.actor, "workload:jbeck:laptop");
+        assert!(r.parent_digest.is_none(), "genesis has no parent");
+        assert!(r.policy_hash.is_some(), "genesis carries policy hash");
+
+        let fetched = store.get_genesis().unwrap().expect("genesis present");
+        assert_eq!(fetched.digest, r.digest);
+        assert_eq!(fetched.actor, "workload:jbeck:laptop");
+    }
+
+    #[test]
+    fn genesis_evidence_carries_fiat_basis_and_instance_id() {
+        let mut store = Store::in_memory().unwrap();
+        let r = store
+            .install_genesis("workload:jbeck:laptop", "hardcoded:v1")
+            .unwrap();
+
+        let ev: serde_json::Value = r.evidence;
+        assert_eq!(ev["basis"], "operator_fiat");
+        assert_eq!(ev["version"], "standing.genesis.v1");
+        assert_eq!(ev["policy_source"], "hardcoded:v1");
+        assert!(ev["prior_grant"].is_null(), "genesis cites no prior grant");
+        assert!(
+            ev["instance_id"].as_str().is_some(),
+            "genesis names an instance_id"
+        );
+    }
+
+    #[test]
+    fn second_genesis_install_is_refused() {
+        let mut store = Store::in_memory().unwrap();
+        let first = store
+            .install_genesis("workload:jbeck:laptop", "hardcoded:v1")
+            .unwrap();
+
+        let err = store
+            .install_genesis("workload:eve:laptop", "evil:v1")
+            .unwrap_err();
+
+        match err {
+            StoreError::GenesisExists(d) => assert_eq!(d, first.digest),
+            other => panic!("expected GenesisExists, got {other:?}"),
+        }
+
+        // First genesis must still be intact and singular.
+        let still = store.get_genesis().unwrap().expect("genesis present");
+        assert_eq!(still.digest, first.digest);
+        assert_eq!(still.actor, "workload:jbeck:laptop");
+    }
+
+    #[test]
+    fn get_genesis_returns_none_before_install() {
+        let store = Store::in_memory().unwrap();
+        assert!(store.get_genesis().unwrap().is_none());
+    }
+
+    #[test]
+    fn policy_hash_is_deterministic_for_same_source() {
+        let mut s1 = Store::in_memory().unwrap();
+        let mut s2 = Store::in_memory().unwrap();
+
+        let r1 = s1.install_genesis("workload:op:a", "hardcoded:v1").unwrap();
+        let r2 = s2.install_genesis("workload:op:b", "hardcoded:v1").unwrap();
+
+        assert_eq!(
+            r1.policy_hash, r2.policy_hash,
+            "same policy source produces same hash across instances"
+        );
     }
 }

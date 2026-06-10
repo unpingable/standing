@@ -686,3 +686,183 @@ fn resolver_decision_records_full_attribution() {
         assert!(d.get(field).is_some(), "missing attribution field {field}");
     }
 }
+
+// ---------------------------------------------------------------
+// Genesis — chain-root receipt, exactly one per instance
+// ---------------------------------------------------------------
+
+#[test]
+fn genesis_install_then_show_returns_receipt() {
+    let db = temp_db();
+    let id_file = temp_identity("jbeck", "laptop", SECRET);
+
+    let (ok, stdout, stderr) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "genesis",
+        "install",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+    ]));
+    assert!(ok, "install failed: {stderr}");
+    assert!(stdout.contains("genesis installed."));
+    assert!(stdout.contains("operator_fiat"));
+    assert!(stdout.contains("wl:jbeck:laptop"));
+
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "genesis",
+        "show",
+    ]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["kind"], "genesis_install");
+    assert_eq!(v["operator"], "wl:jbeck:laptop");
+    assert_eq!(v["evidence"]["basis"], "operator_fiat");
+    assert_eq!(v["evidence"]["version"], "standing.genesis.v1");
+    assert_eq!(v["evidence"]["policy_source"], "hardcoded:v1");
+    assert!(v["evidence"]["prior_grant"].is_null());
+    assert!(v["evidence"]["instance_id"].as_str().is_some());
+    assert!(v["policy_hash"].as_str().is_some());
+}
+
+#[test]
+fn second_genesis_install_is_refused() {
+    let db = temp_db();
+    let id_file = temp_identity("jbeck", "laptop", SECRET);
+
+    let (ok, _, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "genesis",
+        "install",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+    ]));
+    assert!(ok);
+
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "genesis",
+        "install",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+    ]));
+    assert!(!ok, "second install must fail");
+    assert!(
+        stderr.contains("genesis already installed"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn genesis_show_before_install_reports_absence() {
+    let db = temp_db();
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "genesis",
+        "show",
+    ]));
+    assert!(ok);
+    assert!(stdout.contains("no genesis receipt installed"));
+}
+
+#[test]
+fn query_why_footers_genesis_when_present() {
+    let db = temp_db();
+    let id_file = temp_identity("deploy-bot", "host-a", SECRET);
+
+    // First install genesis.
+    let (ok, _, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "genesis",
+        "install",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+    ]));
+    assert!(ok);
+
+    // Then create a grant and walk why.
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "grant",
+        "request",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod/web-api",
+        "--duration",
+        "60",
+    ]));
+    assert!(ok);
+    let grant_id = extract_grant_id(&stdout);
+
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "query",
+        "why",
+        "--id",
+        &grant_id,
+    ]));
+    assert!(ok);
+    assert!(stdout.contains("── chain root ──"));
+    assert!(stdout.contains("genesis install (operator fiat):"));
+    assert!(stdout.contains("operator: wl:deploy-bot:host-a"));
+    assert!(stdout.contains("basis:    \"operator_fiat\""));
+}
+
+#[test]
+fn query_why_footers_silence_when_no_genesis() {
+    let db = temp_db();
+    let id_file = temp_identity("deploy-bot", "host-a", SECRET);
+
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "grant",
+        "request",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod/web-api",
+        "--duration",
+        "60",
+    ]));
+    assert!(ok);
+    let grant_id = extract_grant_id(&stdout);
+
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "query",
+        "why",
+        "--id",
+        &grant_id,
+    ]));
+    assert!(ok);
+    assert!(stdout.contains("── chain root ──"));
+    assert!(stdout.contains("chain terminates in silence"));
+    assert!(stdout.contains("standing genesis install"));
+}

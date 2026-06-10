@@ -41,6 +41,33 @@ enum Commands {
         #[command(subcommand)]
         action: ResolverAction,
     },
+    /// Genesis: name the operator-fiat root of this Standing instance.
+    /// See docs/genesis-receipt.md.
+    Genesis {
+        #[command(subcommand)]
+        action: GenesisAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GenesisAction {
+    /// Install the genesis receipt #0. Exactly one per instance; a second
+    /// install is refused. Records operator (from verified identity),
+    /// policy source + hash, and the explicit-fiat basis.
+    Install {
+        /// Path to signed identity JSON file (operator identity)
+        #[arg(long)]
+        identity: String,
+        /// Shared secret for identity verification
+        #[arg(long)]
+        secret: String,
+        /// Policy source marker. For HardcodedPolicy, leave as the default.
+        /// For external policy artifacts, a path / URL / canonical identifier.
+        #[arg(long, name = "policy-source", default_value = "hardcoded:v1")]
+        policy_source: String,
+    },
+    /// Show this instance's genesis receipt, if one has been installed.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -212,6 +239,7 @@ fn main() {
         Commands::Grant { action } => handle_grant(&cli.db, action),
         Commands::Query { action } => handle_query(&cli.db, action),
         Commands::Resolver { action } => handle_resolver(action),
+        Commands::Genesis { action } => handle_genesis(&cli.db, action),
     };
 
     if let Err(e) = result {
@@ -728,8 +756,111 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                     _ => {}
                 }
             }
+
+            // Footer the chain at the named genesis root if one exists.
+            // Grant receipts are not cryptographically parented to genesis in
+            // the MVP, but the policy authority every decision under this
+            // instance derived from terminates here, citably, not in silence.
+            print_genesis_footer(&store)?;
         }
     }
 
     Ok(())
+}
+
+fn print_genesis_footer(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+    match store.get_genesis()? {
+        Some(g) => {
+            println!("\n  ── chain root ──");
+            println!("  genesis install (operator fiat):");
+            println!("    digest:   {}", g.digest);
+            println!("    operator: {}", g.actor);
+            println!("    instance: {}", g.subject);
+            println!("    time:     {}", g.timestamp);
+            if let Some(ref ph) = g.policy_hash {
+                println!("    policy:   {ph}");
+            }
+            if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&g.evidence) {
+                if let Some(src) = ev.get("policy_source") {
+                    println!("    source:   {src}");
+                }
+                if let Some(basis) = ev.get("basis") {
+                    println!("    basis:    {basis}");
+                }
+            }
+        }
+        None => {
+            println!("\n  ── chain root ──");
+            println!(
+                "  no genesis receipt installed — chain terminates in silence."
+            );
+            println!(
+                "  run `standing genesis install` to make the operator-fiat root citable."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_genesis(
+    db_path: &str,
+    action: GenesisAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        GenesisAction::Install {
+            identity,
+            secret,
+            policy_source,
+        } => {
+            let (principal, _wlid) = resolve_identity(&identity, &secret, None)?;
+
+            let mut store = Store::open(db_path)?;
+            let receipt = store.install_genesis(&principal.id, &policy_source)?;
+
+            let evidence: serde_json::Value =
+                serde_json::from_value(receipt.evidence.clone()).unwrap_or(serde_json::Value::Null);
+            let instance_id = evidence
+                .get("instance_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            println!("genesis installed.");
+            println!("  digest:     {}", receipt.digest);
+            println!("  operator:   {}", receipt.actor);
+            println!("  instance:   {instance_id}");
+            println!("  policy:     {}", receipt.policy_hash.as_deref().unwrap_or(""));
+            println!("  source:     {policy_source}");
+            println!("  basis:      operator_fiat");
+            println!("  time:       {}", receipt.timestamp);
+            Ok(())
+        }
+        GenesisAction::Show => {
+            let store = Store::open(db_path)?;
+            match store.get_genesis()? {
+                Some(g) => {
+                    let evidence: serde_json::Value =
+                        serde_json::from_str(&g.evidence).unwrap_or(serde_json::Value::Null);
+                    let out = serde_json::json!({
+                        "digest": g.digest,
+                        "id": g.id,
+                        "kind": g.kind,
+                        "timestamp": g.timestamp,
+                        "operator": g.actor,
+                        "instance_id": g.subject,
+                        "policy_hash": g.policy_hash,
+                        "evidence": evidence,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                    Ok(())
+                }
+                None => {
+                    println!(
+                        "no genesis receipt installed for this instance — \
+                         run `standing genesis install` to establish one."
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
 }

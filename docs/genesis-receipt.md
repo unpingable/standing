@@ -1,6 +1,6 @@
 # Genesis receipt #0
 
-> **Status:** `candidate / non-binding`. Names the chain-termination gap. Becomes binding when a `standing query why` walk first terminates in silence and the operator wants the silence to be a named receipt instead.
+> **Status:** MVP landed 2026-06-10. The CLI surface (`standing genesis install` / `standing genesis show`) and the `ReceiptKind::GenesisInstall` variant exist and are tested. `standing query why` now footers the genesis as the named chain root, or notes the silence and instructs how to install one. **Deferred:** cryptographic parent-linkage of grant receipts to genesis (today the genesis is a side-by-side root visible in `query why`, not a re-chained ancestor of each grant's first receipt). That step waits for a forcing case.
 >
 > **Composes with:** README "Invariants" block (state-not-cargo), `docs/remote-standing-boundary.md`, `project_standing_design_decisions` (fail-closed on receipts).
 
