@@ -14,6 +14,41 @@ Standing does not implement Kerberos-style ticket transport. Grants are recorded
 
 Current Standing models **entitlement-to-act**: whether an actor may perform an operation against a target. Agentic systems also expose a neighboring need, **entitlement-to-assert**, where the relevant object is a claim that may affect downstream consequence. That surface is roadmap only; its schema and receipt format are not yet designed.
 
+## 30-second specimen
+
+A workload gets a grant — policy says allow, the grant activates, every check
+is green. Then it tries to spend the grant one second past its window:
+
+```bash
+standing grant request --identity bot.id.json --secret bot-key \
+  --action deploy --target prod/web-api --duration 1
+standing grant activate --id <grant-id> --identity bot.id.json --secret bot-key
+sleep 2
+standing grant use --id <grant-id> --identity bot.id.json --secret bot-key \
+  --evidence '{"deployed":"v1.2.3"}'
+# error: grant expired at 2026-06-12T15:52:28.119267816+00:00   (exit 1)
+```
+
+The credential didn't change. The policy didn't change. Time passed — and the
+grant that was valid when issued is not valid when spent. Then ask the system
+to show its work:
+
+```bash
+standing query why --id <grant-id>
+#   subject: wl:deploy-bot:host-abc (deploy-bot)
+#   scope:   deploy → prod/web-api
+#   state:   active
+#   expires: 2026-06-12T15:52:28.119267816+00:00
+#   policy decision:  verdict: "allow"  reason: "all checks passed"
+#   grant issued:     digest: cbf2563a…  time: …:27.119
+#   grant activated:  digest: 0c31ae4a…  time: …:27.132
+```
+
+The full receipt chain — issued, activated, refused — survives the refusal.
+Setup for this run (identities + operator-fiat genesis) is the first four
+commands of the Quick start below; the timestamps and digests above came from
+a real run.
+
 ## Invariants
 
 ```text
