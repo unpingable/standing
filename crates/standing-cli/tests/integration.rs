@@ -264,6 +264,115 @@ fn use_with_wrong_scope_is_refused_and_does_not_consume() {
 }
 
 // ---------------------------------------------------------------
+// standing.grant_use.v1 JSON witness packet (D010b/D010c)
+// ---------------------------------------------------------------
+
+/// Set up a fresh activated grant scoped deploy/prod; return (db_path-owner, id_owner, grant_id).
+fn activated_grant(db: &tempfile::NamedTempFile, id_file: &tempfile::NamedTempFile) -> String {
+    let db_path = db.path().to_str().unwrap();
+    let id_path = id_file.path().to_str().unwrap();
+    let (ok, stdout, stderr) = run(standing().args([
+        "--db", db_path, "grant", "request", "--identity", id_path, "--secret", SECRET,
+        "--action", "deploy", "--target", "prod", "--duration", "300",
+    ]));
+    assert!(ok, "request failed: {stderr}");
+    let grant_id = extract_grant_id(&stdout);
+    let (ok, _, stderr) = run(standing().args([
+        "--db", db_path, "grant", "activate", "--id", &grant_id, "--identity", id_path,
+        "--secret", SECRET,
+    ]));
+    assert!(ok, "activate failed: {stderr}");
+    grant_id
+}
+
+#[test]
+fn grant_use_json_success_packet() {
+    let db = temp_db();
+    let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
+    let grant_id = activated_grant(&db, &id_file);
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(), "grant", "use", "--id", &grant_id,
+        "--identity", id_file.path().to_str().unwrap(), "--secret", SECRET,
+        "--action", "deploy", "--target", "prod", "--json",
+    ]));
+    assert!(ok);
+    assert!(stdout.contains(r#""schema":"standing.grant_use.v1""#), "{stdout}");
+    assert!(stdout.contains(r#""result":"used""#), "{stdout}");
+    assert!(stdout.contains(r#""receipt_kind":"grant_used""#), "{stdout}");
+    assert!(stdout.contains(r#""receipt_digest":""#), "digest required on used: {stdout}");
+}
+
+#[test]
+fn grant_use_json_scope_mismatch_refusal() {
+    let db = temp_db();
+    let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
+    let grant_id = activated_grant(&db, &id_file);
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(), "grant", "use", "--id", &grant_id,
+        "--identity", id_file.path().to_str().unwrap(), "--secret", SECRET,
+        "--action", "deploy", "--target", "staging", "--json",
+    ]));
+    assert!(!ok, "wrong scope must exit nonzero");
+    assert!(stdout.contains(r#""result":"refused""#), "{stdout}");
+    assert!(stdout.contains(r#""refusal_class":"scope_mismatch""#), "{stdout}");
+    assert!(stdout.contains(r#""receipt_digest":null"#), "refusal digest must be null: {stdout}");
+}
+
+#[test]
+fn grant_use_json_not_found_refusal() {
+    let db = temp_db();
+    let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
+    // A syntactically valid but nonexistent grant id.
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(), "grant", "use",
+        "--id", "00000000-0000-0000-0000-000000000000",
+        "--identity", id_file.path().to_str().unwrap(), "--secret", SECRET,
+        "--action", "deploy", "--target", "prod", "--json",
+    ]));
+    assert!(!ok);
+    assert!(stdout.contains(r#""refusal_class":"not_found""#), "{stdout}");
+    assert!(stdout.contains(r#""receipt_digest":null"#), "{stdout}");
+}
+
+#[test]
+fn grant_use_json_subject_mismatch_refusal() {
+    let db = temp_db();
+    let owner = temp_identity("deploy-bot", "host-abc", SECRET);
+    let grant_id = activated_grant(&db, &owner);
+    // A different principal attempts to use the grant.
+    let other = temp_identity("evil-bot", "host-xyz", SECRET);
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db.path().to_str().unwrap(), "grant", "use", "--id", &grant_id,
+        "--identity", other.path().to_str().unwrap(), "--secret", SECRET,
+        "--action", "deploy", "--target", "prod", "--json",
+    ]));
+    assert!(!ok);
+    assert!(stdout.contains(r#""refusal_class":"subject_mismatch""#), "{stdout}");
+}
+
+#[test]
+fn grant_use_json_already_spent_refusal() {
+    let db = temp_db();
+    let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
+    let grant_id = activated_grant(&db, &id_file);
+    let db_path = db.path().to_str().unwrap();
+    let id_path = id_file.path().to_str().unwrap();
+    // First (valid) spend.
+    let (ok, _, _) = run(standing().args([
+        "--db", db_path, "grant", "use", "--id", &grant_id, "--identity", id_path,
+        "--secret", SECRET, "--action", "deploy", "--target", "prod", "--json",
+    ]));
+    assert!(ok);
+    // Second spend → already_spent.
+    let (ok, stdout, _) = run(standing().args([
+        "--db", db_path, "grant", "use", "--id", &grant_id, "--identity", id_path,
+        "--secret", SECRET, "--action", "deploy", "--target", "prod", "--json",
+    ]));
+    assert!(!ok);
+    assert!(stdout.contains(r#""refusal_class":"already_spent""#), "{stdout}");
+}
+
+// ---------------------------------------------------------------
 // Revocation
 // ---------------------------------------------------------------
 

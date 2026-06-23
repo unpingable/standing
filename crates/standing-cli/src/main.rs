@@ -219,6 +219,9 @@ enum GrantAction {
         /// Evidence of what was done (JSON string)
         #[arg(long, default_value = "{}")]
         evidence: String,
+        /// Emit a standing.grant_use.v1 JSON witness packet to stdout (machine-readable)
+        #[arg(long)]
+        json: bool,
     },
     /// Revoke a grant (subject self-revoke or admin revoke)
     Revoke {
@@ -347,6 +350,22 @@ fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Map a grant-use `StoreError` to a closed `standing.grant_use.v1` `refusal_class`, or
+/// `None` for internal/transport-class errors. `None` means "not a typed grant refusal" — the
+/// error surfaces as prose so a consumer reads it as *cannot verify*, never as a Standing
+/// refusal. Closed set per D010c.
+fn grant_use_refusal_class(err: &standing_store::StoreError) -> Option<&'static str> {
+    use standing_store::StoreError as E;
+    match err {
+        E::ScopeMismatch { .. } => Some("scope_mismatch"),
+        E::GrantExpired(_) => Some("expired"),
+        E::Unauthorized { .. } => Some("subject_mismatch"),
+        E::GrantNotFound(_) => Some("not_found"),
+        E::InvalidTransition { from, .. } if from.contains("used") => Some("already_spent"),
+        _ => None,
+    }
+}
+
 fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open(db_path)?;
     let mut replay_guard = store.replay_guard()?;
@@ -466,11 +485,22 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             action,
             target,
             evidence,
+            json,
         } => {
             let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
+            let subject_id = principal.id.clone();
             let actor_ctx = ActorContext::subject(principal);
             let evidence: serde_json::Value = serde_json::from_str(&evidence)?;
-            let attempted = standing_grant::GrantScope { action, target };
+            let attempted = standing_grant::GrantScope {
+                action: action.clone(),
+                target: target.clone(),
+            };
+            // The grant's bound scope (if it exists) for the witness packet.
+            let granted = store
+                .get_grant(&id)
+                .ok()
+                .flatten()
+                .map(|g| (g.action, g.target));
             let result = store.transition_scoped(
                 &id,
                 standing_grant::GrantState::Used,
@@ -479,9 +509,57 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                 evidence,
                 None,
                 &attempted,
-            )?;
-            println!("used {id}");
-            println!("  receipt: {}", result.receipt_digest);
+            );
+
+            if json {
+                // standing.grant_use.v1 — machine-readable witness packet (D010c).
+                let granted_json = granted.as_ref().map(|(a, t)| {
+                    serde_json::json!({ "action": a, "target": t })
+                });
+                match result {
+                    Ok(r) => {
+                        let packet = serde_json::json!({
+                            "schema": "standing.grant_use.v1",
+                            "result": "used",
+                            "grant_id": id,
+                            "subject": subject_id,
+                            "attempted": { "action": action, "target": target },
+                            "granted": granted_json,
+                            "receipt_digest": r.receipt_digest,
+                            "receipt_kind": "grant_used",
+                        });
+                        println!("{}", serde_json::to_string(&packet)?);
+                    }
+                    Err(e) => match grant_use_refusal_class(&e) {
+                        // A typed grant-domain refusal: emit the refused packet. Asymmetric
+                        // custody (D010c) — no transition occurred, so receipt_digest is null.
+                        Some(class) => {
+                            let packet = serde_json::json!({
+                                "schema": "standing.grant_use.v1",
+                                "result": "refused",
+                                "grant_id": id,
+                                "subject": subject_id,
+                                "attempted": { "action": action, "target": target },
+                                "granted": granted_json,
+                                "refusal_class": class,
+                                "receipt_digest": serde_json::Value::Null,
+                                "receipt_kind": serde_json::Value::Null,
+                                "detail": e.to_string(),
+                            });
+                            println!("{}", serde_json::to_string(&packet)?);
+                            std::process::exit(1);
+                        }
+                        // Not a typed grant refusal (internal/transport-class error): let it
+                        // surface as a prose error so a consumer reads it as "cannot verify",
+                        // NOT as a Standing refusal.
+                        None => return Err(e.into()),
+                    },
+                }
+            } else {
+                let r = result?;
+                println!("used {id}");
+                println!("  receipt: {}", r.receipt_digest);
+            }
         }
         GrantAction::Revoke {
             id,
