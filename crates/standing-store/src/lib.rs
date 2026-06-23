@@ -14,7 +14,7 @@ use rusqlite::{params, Connection, Transaction};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use standing_grant::{ActorContext, GrantState, PrincipalRole, auth};
+use standing_grant::{ActorContext, GrantScope, GrantState, PrincipalRole, auth};
 use standing_receipt::{Receipt, ReceiptBuilder, ReceiptKind};
 
 /// Errors from the store.
@@ -40,6 +40,9 @@ pub enum StoreError {
 
     #[error("grant expired at {0}")]
     GrantExpired(String),
+
+    #[error("scope mismatch: grant authorizes {granted}, attempted {attempted}")]
+    ScopeMismatch { granted: String, attempted: String },
 
     #[error("unauthorized: actor {actor} (role: {role}) cannot perform {transition}")]
     Unauthorized {
@@ -363,12 +366,50 @@ impl Store {
         evidence: serde_json::Value,
         policy_hash: Option<&str>,
     ) -> Result<TransitionResult, StoreError> {
+        self.transition_inner(
+            grant_id, target_state, receipt_kind, actor_ctx, evidence, policy_hash, None,
+        )
+    }
+
+    /// Like [`Store::transition`], but for a spend that must match the grant's bound
+    /// scope. The attempted `(action, target)` is checked against the issued `GrantScope`
+    /// BEFORE any write; a mismatch refuses with [`StoreError::ScopeMismatch`] and leaves
+    /// the grant unspent (non-consuming — a wrong-target presentation cannot burn a
+    /// single-use grant). Standing owns this refusal; consumers inherit it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transition_scoped(
+        &mut self,
+        grant_id: &str,
+        target_state: GrantState,
+        receipt_kind: ReceiptKind,
+        actor_ctx: &ActorContext,
+        evidence: serde_json::Value,
+        policy_hash: Option<&str>,
+        attempted: &GrantScope,
+    ) -> Result<TransitionResult, StoreError> {
+        self.transition_inner(
+            grant_id, target_state, receipt_kind, actor_ctx, evidence, policy_hash,
+            Some(attempted),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_inner(
+        &mut self,
+        grant_id: &str,
+        target_state: GrantState,
+        receipt_kind: ReceiptKind,
+        actor_ctx: &ActorContext,
+        evidence: serde_json::Value,
+        policy_hash: Option<&str>,
+        attempted_scope: Option<&GrantScope>,
+    ) -> Result<TransitionResult, StoreError> {
         let tx = self.conn.transaction()?;
 
         // Step 1: Read current state (inside transaction for isolation)
         let grant = {
             let mut stmt = tx.prepare(
-                "SELECT state, latest_receipt_digest, subject_id, expires_at FROM grants WHERE id = ?1",
+                "SELECT state, latest_receipt_digest, subject_id, expires_at, action, target FROM grants WHERE id = ?1",
             )?;
             let mut rows = stmt.query_map(params![grant_id], |row| {
                 Ok(GrantSnapshot {
@@ -376,6 +417,8 @@ impl Store {
                     head_digest: row.get::<_, String>(1)?,
                     subject_id: row.get::<_, String>(2)?,
                     expires_at: row.get::<_, Option<String>>(3)?,
+                    action: row.get::<_, String>(4)?,
+                    target: row.get::<_, String>(5)?,
                 })
             })?;
             match rows.next() {
@@ -418,6 +461,20 @@ impl Store {
                 role: "subject (wrong principal)".to_string(),
                 transition: format!("{} → {}", current_state, target_state),
             });
+        }
+
+        // Step 3c: Scope binding — if the caller named an attempted (action, target),
+        // it must match the grant's bound scope. Checked BEFORE any write, so a mismatch
+        // refuses without spending (the grant stays unspent — non-consuming, so a
+        // wrong-target presentation cannot burn a single-use grant). Standing owns this
+        // refusal; a consumer adapting the grant inherits it rather than inventing it.
+        if let Some(att) = attempted_scope {
+            if att.action != grant.action || att.target != grant.target {
+                return Err(StoreError::ScopeMismatch {
+                    granted: format!("{}/{}", grant.action, grant.target),
+                    attempted: format!("{}/{}", att.action, att.target),
+                });
+            }
         }
 
         // Step 4: Contextual guards
@@ -595,6 +652,8 @@ struct GrantSnapshot {
     head_digest: String,
     subject_id: String,
     expires_at: Option<String>,
+    action: String,
+    target: String,
 }
 
 /// Result of a successful transition.
@@ -694,6 +753,80 @@ mod tests {
             .unwrap();
 
         (store, id_str)
+    }
+
+    // ---------------------------------------------------------------
+    // Spend-time scope matching (Model X / D010, D010a)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn scope_mismatch_refuses_and_does_not_consume() {
+        // Grant scope is (deploy, prod) per meta(); attempt (deploy, staging).
+        let (mut store, id) = setup_active_grant(Utc::now() + Duration::hours(1));
+        let err = store
+            .transition_scoped(
+                &id,
+                GrantState::Used,
+                ReceiptKind::GrantUsed,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+                &GrantScope {
+                    action: "deploy".to_string(),
+                    target: "staging".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ScopeMismatch { .. }), "got {err:?}");
+
+        // Non-consuming (D010a): the grant is unspent, so a subsequently VALID-scope
+        // use still succeeds — a wrong-target presentation did not burn the grant.
+        let ok = store.transition_scoped(
+            &id,
+            GrantState::Used,
+            ReceiptKind::GrantUsed,
+            &bot_subject(),
+            serde_json::Value::Null,
+            None,
+            &GrantScope {
+                action: "deploy".to_string(),
+                target: "prod".to_string(),
+            },
+        );
+        assert!(ok.is_ok(), "grant must be unspent after a scope mismatch: {ok:?}");
+    }
+
+    #[test]
+    fn scope_match_spends_and_single_spend_still_holds() {
+        let (mut store, id) = setup_active_grant(Utc::now() + Duration::hours(1));
+        let r = store.transition_scoped(
+            &id,
+            GrantState::Used,
+            ReceiptKind::GrantUsed,
+            &bot_subject(),
+            serde_json::Value::Null,
+            None,
+            &GrantScope {
+                action: "deploy".to_string(),
+                target: "prod".to_string(),
+            },
+        );
+        assert!(r.is_ok(), "matching scope should spend: {r:?}");
+
+        // Single-spend composes: a second use is refused (terminal Used).
+        let again = store.transition_scoped(
+            &id,
+            GrantState::Used,
+            ReceiptKind::GrantUsed,
+            &bot_subject(),
+            serde_json::Value::Null,
+            None,
+            &GrantScope {
+                action: "deploy".to_string(),
+                target: "prod".to_string(),
+            },
+        );
+        assert!(again.is_err(), "second spend must be refused (terminal Used)");
     }
 
     // ---------------------------------------------------------------

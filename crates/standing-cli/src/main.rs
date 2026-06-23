@@ -210,6 +210,12 @@ enum GrantAction {
         /// Shared secret for identity verification
         #[arg(long)]
         secret: String,
+        /// Action being attempted — must match the grant's bound scope
+        #[arg(long)]
+        action: String,
+        /// Target being attempted — must match the grant's bound scope
+        #[arg(long)]
+        target: String,
         /// Evidence of what was done (JSON string)
         #[arg(long, default_value = "{}")]
         evidence: String,
@@ -457,18 +463,22 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             id,
             identity,
             secret,
+            action,
+            target,
             evidence,
         } => {
             let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
             let actor_ctx = ActorContext::subject(principal);
             let evidence: serde_json::Value = serde_json::from_str(&evidence)?;
-            let result = store.transition(
+            let attempted = standing_grant::GrantScope { action, target };
+            let result = store.transition_scoped(
                 &id,
                 standing_grant::GrantState::Used,
                 standing_receipt::ReceiptKind::GrantUsed,
                 &actor_ctx,
                 evidence,
                 None,
+                &attempted,
             )?;
             println!("used {id}");
             println!("  receipt: {}", result.receipt_digest);

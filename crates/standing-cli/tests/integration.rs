@@ -113,6 +113,7 @@ fn full_lifecycle_happy_path() {
     let (ok, stdout, stderr) = run(standing()
         .args(["--db", db_path, "grant", "use",
                "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "prod/web-api",
                "--evidence", r#"{"deployed":"v1.0"}"#]));
     assert!(ok, "use failed: {stderr}");
     assert!(stdout.contains("used"));
@@ -210,15 +211,56 @@ fn double_use_rejected() {
     // Use
     let (ok, _, _) = run(standing()
         .args(["--db", db_path, "grant", "use",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET]));
+               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "prod"]));
     assert!(ok);
 
     // Second use — should fail
     let (ok, _, stderr) = run(standing()
         .args(["--db", db_path, "grant", "use",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET]));
+               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "prod"]));
     assert!(!ok);
     assert!(stderr.contains("invalid transition"));
+}
+
+// ---------------------------------------------------------------
+// Spend-time scope matching (Model X / D010, D010a)
+// ---------------------------------------------------------------
+
+#[test]
+fn use_with_wrong_scope_is_refused_and_does_not_consume() {
+    let db = temp_db();
+    let db_path = db.path().to_str().unwrap();
+    let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
+    let id_path = id_file.path().to_str().unwrap();
+
+    // Grant scoped to deploy/prod.
+    let (ok, stdout, stderr) = run(standing()
+        .args(["--db", db_path, "grant", "request",
+               "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    assert!(ok, "request failed: {stderr}");
+    let grant_id = extract_grant_id(&stdout);
+    let (ok, _, stderr) = run(standing()
+        .args(["--db", db_path, "grant", "activate",
+               "--id", &grant_id, "--identity", id_path, "--secret", SECRET]));
+    assert!(ok, "activate failed: {stderr}");
+
+    // Use with the WRONG target → refused with scope mismatch.
+    let (ok, _, stderr) = run(standing()
+        .args(["--db", db_path, "grant", "use",
+               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "staging"]));
+    assert!(!ok, "wrong-scope use must be refused");
+    assert!(stderr.contains("scope mismatch"), "stderr: {stderr}");
+
+    // Non-consuming: the correctly-scoped use still succeeds (grant not burned).
+    let (ok, _, stderr) = run(standing()
+        .args(["--db", db_path, "grant", "use",
+               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
+               "--action", "deploy", "--target", "prod"]));
+    assert!(ok, "grant must be unspent after a scope mismatch: {stderr}");
 }
 
 // ---------------------------------------------------------------
