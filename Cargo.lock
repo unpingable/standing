@@ -703,6 +703,7 @@ dependencies = [
  "sha2",
  "standing-grant",
  "standing-identity",
+ "standing-policy",
  "standing-receipt",
  "thiserror",
  "uuid",

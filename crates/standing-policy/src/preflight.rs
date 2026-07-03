@@ -111,6 +111,16 @@ pub enum AssertCheckDecision {
     /// kind of operation, but Standing has no `AssertionGrant` lease
     /// lifecycle installed yet. Refusal is structural, not stylistic.
     RequiredNotImplemented,
+    /// Effect requires assert-standing, a lease covers this request, and it is
+    /// fresh (scope-covered, within-validity, not-replayed, budget-remaining).
+    /// Only the **spend** path returns this as authorizing (`authorizes_effect`
+    /// true, with `emitted_receipt_digest` set); the **preview** path returns it
+    /// as `authorizes_effect = false` — "would be available," not "is granted."
+    RequiredAndAvailable,
+    /// Effect requires assert-standing and a lease exists (or could), but this
+    /// request falls outside it — expired, out of scope, replayed, exhausted, or
+    /// no covering lease. `reason` names the axis.
+    RequiredButDenied,
 }
 
 /// Refusal-mode strings the preflight surface emits in `reason`. Consumers
@@ -119,6 +129,10 @@ pub enum AssertCheckDecision {
 pub mod assert_basis {
     pub const EFFECT_NON_BINDING: &str = "effect_non_binding";
     pub const ASSERTION_STANDING_NOT_IMPLEMENTED: &str = "assertion_standing_not_implemented";
+    /// Success: a lease covers this request and it is fresh.
+    pub const ASSERTION_AVAILABLE: &str = "assertion_available";
+    /// No covering lease exists for this actor/audience.
+    pub const NO_COVERING_LEASE: &str = "no_covering_lease";
 }
 
 /// Cited authority context. Both fields are optional because an instance
@@ -145,6 +159,32 @@ pub struct AssertCheckResult {
     pub required_for: Option<String>,
     pub act_standing_sufficient: bool,
     pub assert_standing_required: bool,
+    /// **The anti-laundering bit (amendment #2).** True ONLY when the spend path
+    /// recorded a replay nonce and emitted an `AssertionMade` receipt whose
+    /// digest is in `emitted_receipt_digest`. A `preview` decision, a
+    /// `NotRequired`, a `RequiredButDenied`, and a `RequiredNotImplemented` are
+    /// all `false`. A consumer that binds/mutates MUST require this true.
+    #[serde(default)]
+    pub authorizes_effect: bool,
+    /// `"preview"` (dry-run, non-consuming) or `"spend"` (recorded), or `None`
+    /// for the pure preflight door (which resolves nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_mode: Option<String>,
+    /// Digest of the `AssertionMade` receipt, when the spend path emitted one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitted_receipt_digest: Option<String>,
+    /// `"unbounded_kind_scope"` when the covering lease has no use budget (L1) —
+    /// paired with `certified_sound = Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_bound: Option<String>,
+    /// Whether the reuse posture is one the math certifies sound (L1). `None`
+    /// when not applicable; `Some(false)` for an unbounded lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certified_sound: Option<bool>,
+    /// Freshness strength actually established: `"within_validity"` in Phase 4b
+    /// (no clock-divergence/MAC yet — NOT full Lean-`Fresh`), or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
     pub why: AssertCheckWhy,
     /// Echoed back from the request so receipts and audit trails on the
     /// consumer side can compose without re-threading.
@@ -169,6 +209,12 @@ pub fn check_assert(
             required_for: None,
             act_standing_sufficient: true,
             assert_standing_required: false,
+            authorizes_effect: false,
+            decision_mode: None,
+            emitted_receipt_digest: None,
+            reuse_bound: None,
+            certified_sound: None,
+            freshness: None,
             why: AssertCheckWhy {
                 genesis: genesis_digest.map(String::from),
                 policy: policy_hash.map(String::from),
@@ -192,6 +238,12 @@ pub fn check_assert(
                 required_for: Some(required_for.into()),
                 act_standing_sufficient: false,
                 assert_standing_required: true,
+                authorizes_effect: false,
+                decision_mode: None,
+                emitted_receipt_digest: None,
+                reuse_bound: None,
+                certified_sound: None,
+                freshness: None,
                 why: AssertCheckWhy {
                     genesis: genesis_digest.map(String::from),
                     policy: policy_hash.map(String::from),

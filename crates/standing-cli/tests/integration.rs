@@ -1194,3 +1194,193 @@ fn assert_check_rejects_unknown_effect() {
     assert!(!ok);
     assert!(stderr.contains("unknown effect"), "stderr was: {stderr}");
 }
+
+// ---------------------------------------------------------------
+// Assertion leases (Phase 4b)
+// ---------------------------------------------------------------
+
+fn install_genesis(db: &str, op: &str) {
+    let (ok, _o, e) = run(standing().args([
+        "--db", db, "genesis", "install", "--identity", op, "--secret", SECRET,
+    ]));
+    assert!(ok, "genesis install failed: {e}");
+}
+
+#[test]
+fn assert_grant_requires_genesis() {
+    let db = temp_db();
+    let dbp = db.path().to_str().unwrap();
+    let speaker = temp_identity("speaker", "host1", SECRET);
+    // No genesis installed yet — issuance must fail closed (L4).
+    let (ok, _o, e) = run(standing().args([
+        "--db", dbp, "assert", "grant",
+        "--identity", speaker.path().to_str().unwrap(), "--secret", SECRET,
+        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
+        "--audience", "nq:main", "--max-uses", "2",
+    ]));
+    assert!(!ok);
+    assert!(e.contains("no genesis"), "expected genesis fail-closed, got: {e}");
+}
+
+#[test]
+fn assert_grant_requires_a_budget_choice() {
+    let db = temp_db();
+    let dbp = db.path().to_str().unwrap();
+    let op = temp_identity("operator", "laptop", SECRET);
+    install_genesis(dbp, op.path().to_str().unwrap());
+    let speaker = temp_identity("speaker", "host1", SECRET);
+    // Neither --max-uses nor --unbounded → refused (L1: must choose).
+    let (ok, _o, e) = run(standing().args([
+        "--db", dbp, "assert", "grant",
+        "--identity", speaker.path().to_str().unwrap(), "--secret", SECRET,
+        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
+        "--audience", "nq:main",
+    ]));
+    assert!(!ok);
+    assert!(e.contains("use budget"), "expected budget-required refusal, got: {e}");
+}
+
+#[test]
+fn assert_lease_spend_reuse_replay_and_exhaustion() {
+    let db = temp_db();
+    let dbp = db.path().to_str().unwrap();
+    let op = temp_identity("operator", "laptop", SECRET);
+    install_genesis(dbp, op.path().to_str().unwrap());
+    let speaker = temp_identity("speaker", "host1", SECRET);
+    let sp = speaker.path().to_str().unwrap();
+
+    let (ok, out, e) = run(standing().args([
+        "--db", dbp, "assert", "grant", "--identity", sp, "--secret", SECRET,
+        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
+        "--audience", "nq:main", "--max-uses", "2",
+    ]));
+    assert!(ok, "grant failed: {e}");
+    let gid = extract_grant_id(&out.lines().next().unwrap().replace("assertion lease", ""));
+
+    let prove = |jti: &str, subject: &str| {
+        run(standing().args([
+            "--db", dbp, "assert", "prove", "--id", &gid, "--identity", sp, "--secret", SECRET,
+            "--claim-kind", "sqlite_wal_state", "--subject-id", subject, "--audience", "nq:main",
+            "--jti", jti,
+        ]))
+    };
+
+    // Spend #1 ok (auto-activates).
+    let (ok, out, _) = prove("j1", "labelwatch/foo");
+    assert!(ok);
+    assert!(out.contains("spend #1"));
+
+    // Replay of j1 refused.
+    let (ok, _o, e) = prove("j1", "labelwatch/foo");
+    assert!(!ok);
+    assert!(e.contains("replay detected"), "got: {e}");
+
+    // Out-of-scope subject refused, non-consuming.
+    let (ok, _o, e) = prove("j-oops", "other/x");
+    assert!(!ok);
+    assert!(e.contains("out of lease scope"), "got: {e}");
+
+    // Spend #2 exhausts the budget of 2.
+    let (ok, out, _) = prove("j2", "labelwatch/bar");
+    assert!(ok);
+    assert!(out.contains("EXHAUSTED"), "expected exhaustion notice, got: {out}");
+
+    // Spend #3 refused — budget spent.
+    let (ok, _o, e) = prove("j3", "labelwatch/baz");
+    assert!(!ok);
+    assert!(e.contains("budget exhausted"), "got: {e}");
+}
+
+#[test]
+fn resolve_preview_authorizes_nothing_spend_authorizes() {
+    let db = temp_db();
+    let dbp = db.path().to_str().unwrap();
+    let op = temp_identity("operator", "laptop", SECRET);
+    install_genesis(dbp, op.path().to_str().unwrap());
+    let speaker = temp_identity("speaker", "host1", SECRET);
+    let sp = speaker.path().to_str().unwrap();
+
+    let (_ok, out, _e) = run(standing().args([
+        "--db", dbp, "assert", "grant", "--identity", sp, "--secret", SECRET,
+        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
+        "--audience", "nq:main", "--max-uses", "5",
+    ]));
+    let gid = extract_grant_id(&out.lines().next().unwrap().replace("assertion lease", ""));
+
+    let resolve = |jti: &str, extra: &[&str]| {
+        let mut args = vec![
+            "--db", dbp, "assert", "resolve",
+            "--principal", "wl:speaker:host1", "--consumer", "nq:main",
+            "--claim-kind", "sqlite_wal_state", "--target", "labelwatch/foo", "--effect", "binding",
+            "--id", &gid, "--identity", sp, "--secret", SECRET,
+            "--subject-id", "labelwatch/foo", "--jti", jti,
+        ];
+        args.extend_from_slice(extra);
+        run(standing().args(&args))
+    };
+
+    // Preview: RequiredAndAvailable but authorizes_effect=false, no receipt.
+    let (ok, out, _) = resolve("rp1", &["--preview"]);
+    assert!(ok);
+    assert!(out.contains("\"required_and_available\""));
+    assert!(out.contains("\"authorizes_effect\": false"), "preview must not authorize: {out}");
+    assert!(out.contains("\"preview\""));
+
+    // Spend: authorizes_effect=true, emits a receipt digest.
+    let (ok, out, _) = resolve("rp2", &[]);
+    assert!(ok);
+    assert!(out.contains("\"authorizes_effect\": true"), "spend must authorize: {out}");
+    assert!(out.contains("emitted_receipt_digest"));
+    assert!(out.contains("within_validity"));
+}
+
+#[test]
+fn policy_freeze_denies_then_thaw_restores() {
+    let db = temp_db();
+    let dbp = db.path().to_str().unwrap();
+    let op = temp_identity("operator", "laptop", SECRET);
+    let opp = op.path().to_str().unwrap();
+    install_genesis(dbp, opp);
+    let speaker = temp_identity("speaker", "host1", SECRET);
+    let sp = speaker.path().to_str().unwrap();
+
+    let (_ok, out, _) = run(standing().args([
+        "--db", dbp, "assert", "grant", "--identity", sp, "--secret", SECRET,
+        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
+        "--audience", "nq:main", "--max-uses", "5",
+    ]));
+    let gid = extract_grant_id(&out.lines().next().unwrap().replace("assertion lease", ""));
+
+    let prove = |jti: &str| run(standing().args([
+        "--db", dbp, "assert", "prove", "--id", &gid, "--identity", sp, "--secret", SECRET,
+        "--claim-kind", "sqlite_wal_state", "--subject-id", "labelwatch/foo",
+        "--audience", "nq:main", "--jti", jti,
+    ]));
+
+    // Freeze the claim_kind class.
+    let (ok, _o, e) = run(standing().args([
+        "--db", dbp, "policy", "freeze", "--handle", "inc-1",
+        "--class-type", "claim_kind", "--class-value", "sqlite_wal_state",
+        "--reason", "storage incident", "--identity", opp, "--secret", SECRET,
+    ]));
+    assert!(ok, "freeze failed: {e}");
+
+    // Spend refused with class_frozen.
+    let (ok, _o, e) = prove("f1");
+    assert!(!ok);
+    assert!(e.contains("class frozen"), "expected class_frozen, got: {e}");
+
+    // List shows the active freeze.
+    let (ok, out, _) = run(standing().args(["--db", dbp, "policy", "list-freezes"]));
+    assert!(ok);
+    assert!(out.contains("inc-1"));
+
+    // Thaw, then the same lease spends again.
+    let (ok, _o, e) = run(standing().args([
+        "--db", dbp, "policy", "thaw", "--handle", "inc-1", "--identity", opp, "--secret", SECRET,
+    ]));
+    assert!(ok, "thaw failed: {e}");
+    let (ok, out, _) = prove("f2");
+    assert!(ok, "spend after thaw should succeed");
+    assert!(out.contains("spend #1"));
+}

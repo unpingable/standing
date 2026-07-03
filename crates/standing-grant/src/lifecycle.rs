@@ -111,10 +111,20 @@ impl GrantMachine {
     /// Start a new grant lifecycle from a request.
     /// Emits a GrantRequested receipt.
     pub fn request(req: &GrantRequest) -> Result<Self, GrantError> {
+        Self::request_rooted(req, None)
+    }
+
+    /// Like [`GrantMachine::request`], but cryptographically roots the chain's
+    /// first receipt at the instance genesis: the `GrantRequested` receipt's
+    /// `parent_digest` is set to `genesis_digest`, so `query why`/`query chain`
+    /// walk terminates AT the named operator-fiat root rather than beside it.
+    /// `None` leaves the chain unrooted (pre-genesis instances / act-grants
+    /// created before a genesis was installed).
+    pub fn request_rooted(req: &GrantRequest, genesis_digest: Option<&str>) -> Result<Self, GrantError> {
         let grant_id = Uuid::new_v4();
         let subject = grant_id.to_string();
 
-        let receipt = ReceiptBuilder::new(ReceiptKind::GrantRequested, &req.subject.id, &subject)
+        let mut builder = ReceiptBuilder::new(ReceiptKind::GrantRequested, &req.subject.id, &subject)
             .evidence(serde_json::json!({
                 "subject": req.subject,
                 "scope": {
@@ -122,10 +132,13 @@ impl GrantMachine {
                     "target": req.scope.target,
                 },
                 "duration_secs": req.duration_secs,
+                "not_before": req.not_before.map(|t| t.to_rfc3339()),
                 "context": req.context,
-            }))
-            .build()
-            .map_err(GrantError::Receipt)?;
+            }));
+        if let Some(g) = genesis_digest {
+            builder = builder.parent_digest(g);
+        }
+        let receipt = builder.build().map_err(GrantError::Receipt)?;
 
         let chain = ReceiptChain::new(receipt);
 
@@ -147,10 +160,15 @@ impl GrantMachine {
         self.require_state(&GrantState::Requested)?;
 
         let now = Utc::now();
+        let not_before = self.chain.receipts()[0].evidence["not_before"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.to_utc());
         let grant = Grant {
             id: self.grant_id,
             subject: self.subject_from_chain(),
             scope: self.scope_from_chain(),
+            not_before,
             issued_at: now,
             expires_at: now + Duration::seconds(duration_secs as i64),
         };
@@ -158,7 +176,7 @@ impl GrantMachine {
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantIssued,
             &grant.subject.id,
-            &self.grant_id.to_string(),
+            self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
         .policy_hash(policy_hash)
@@ -183,7 +201,7 @@ impl GrantMachine {
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantDenied,
             self.subject_id(),
-            &self.grant_id.to_string(),
+            self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
         .policy_hash(policy_hash)
@@ -204,7 +222,7 @@ impl GrantMachine {
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantActivated,
             self.subject_id(),
-            &self.grant_id.to_string(),
+            self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
         .build()
@@ -223,7 +241,7 @@ impl GrantMachine {
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantUsed,
             self.subject_id(),
-            &self.grant_id.to_string(),
+            self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
         .evidence(evidence)
@@ -247,7 +265,7 @@ impl GrantMachine {
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantExpired,
             self.subject_id(),
-            &self.grant_id.to_string(),
+            self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
         .build()
@@ -270,7 +288,7 @@ impl GrantMachine {
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantRevoked,
             self.subject_id(),
-            &self.grant_id.to_string(),
+            self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
         .evidence(serde_json::json!({"reason": reason}))
@@ -294,7 +312,7 @@ impl GrantMachine {
         let receipt = ReceiptBuilder::new(
             ReceiptKind::GrantAbandoned,
             self.subject_id(),
-            &self.grant_id.to_string(),
+            self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
         .build()
@@ -358,13 +376,12 @@ impl GrantMachine {
     }
 
     fn check_not_expired(&self) -> Result<(), GrantError> {
-        if let Some(grant) = &self.grant {
-            if grant.is_expired_at(Utc::now()) {
+        if let Some(grant) = &self.grant
+            && grant.is_expired_at(Utc::now()) {
                 return Err(GrantError::Expired {
                     expired_at: grant.expires_at.to_rfc3339(),
                 });
             }
-        }
         Ok(())
     }
 }
@@ -384,6 +401,7 @@ mod tests {
                 target: "prod/web-api".to_string(),
             },
             duration_secs: 300,
+            not_before: None,
             context: serde_json::json!({"ticket": "DEPLOY-1234"}),
         }
     }

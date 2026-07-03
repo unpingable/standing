@@ -380,6 +380,137 @@ fn sign(
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
+/// Compute a hex HMAC-SHA256 tag over `msg` with `secret`. The shared MAC
+/// primitive — used for identity claim signatures and (via the store) for
+/// per-request assertion proofs, so both rest on one audited construction.
+pub fn hmac_hex(secret: &[u8], msg: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(msg);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+// -----------------------------------------------------------------------
+// Key resolution & rotation (Phase 5)
+// -----------------------------------------------------------------------
+
+/// Resolves a claim's `kid` to the secret key material that should verify it.
+///
+/// This is the seam the single-secret `verify_identity` left open: the claim
+/// already carries and signs a `kid` (so rotation is expressible), but nothing
+/// mapped `kid → secret`. A resolver closes that. An unknown `kid` is a
+/// first-class refusal ([`AssessmentResult::UnknownKeyId`]), not a signature
+/// failure — "we don't hold that key" is a different fact from "the signature
+/// is wrong."
+pub trait KeyResolver {
+    /// Return the secret for `kid`, or `None` if this verifier doesn't hold it.
+    fn resolve(&self, kid: &str) -> Option<&[u8]>;
+}
+
+/// A single-key resolver — the pre-rotation world, made explicit. Verifies only
+/// claims whose `kid` matches; everything else is `UnknownKeyId`.
+pub struct SingleKey {
+    kid: String,
+    secret: Vec<u8>,
+}
+
+impl SingleKey {
+    pub fn new(kid: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
+        Self { kid: kid.into(), secret: secret.into() }
+    }
+
+    /// The conventional default-kid single key.
+    pub fn default_kid(secret: impl Into<Vec<u8>>) -> Self {
+        Self::new(DEFAULT_KID, secret)
+    }
+}
+
+impl KeyResolver for SingleKey {
+    fn resolve(&self, kid: &str) -> Option<&[u8]> {
+        (kid == self.kid).then_some(self.secret.as_slice())
+    }
+}
+
+/// A rotation-aware key set: one `primary` key (new signatures use it) and an
+/// optional `legacy` key kept live during the overlap window so in-flight
+/// claims signed under the old key still verify. Rotating is: promote a new
+/// primary, demote the old one to legacy, then drop legacy once no claim signed
+/// under it can still be within its TTL.
+pub struct KeySet {
+    primary_kid: String,
+    primary_secret: Vec<u8>,
+    legacy_kid: Option<String>,
+    legacy_secret: Option<Vec<u8>>,
+}
+
+impl KeySet {
+    pub fn new(primary_kid: impl Into<String>, primary_secret: impl Into<Vec<u8>>) -> Self {
+        Self {
+            primary_kid: primary_kid.into(),
+            primary_secret: primary_secret.into(),
+            legacy_kid: None,
+            legacy_secret: None,
+        }
+    }
+
+    /// Add the legacy (outgoing) key kept live during the overlap window.
+    pub fn with_legacy(mut self, kid: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
+        self.legacy_kid = Some(kid.into());
+        self.legacy_secret = Some(secret.into());
+        self
+    }
+
+    /// The kid new signatures should use.
+    pub fn primary_kid(&self) -> &str {
+        &self.primary_kid
+    }
+}
+
+impl KeyResolver for KeySet {
+    fn resolve(&self, kid: &str) -> Option<&[u8]> {
+        if kid == self.primary_kid {
+            Some(self.primary_secret.as_slice())
+        } else if self.legacy_kid.as_deref() == Some(kid) {
+            self.legacy_secret.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
+/// Like [`verify_identity`], but resolves the claim's `kid` through a
+/// [`KeyResolver`] first. An unknown kid short-circuits to
+/// [`AssessmentResult::UnknownKeyId`] — fail-closed, before any signature work.
+pub fn verify_identity_with_keys(
+    id: &WorkloadId,
+    keys: &dyn KeyResolver,
+    opts: &VerifyOptions,
+) -> AssessmentResult {
+    match keys.resolve(&id.kid) {
+        Some(secret) => verify_identity(id, secret, opts),
+        None => AssessmentResult::UnknownKeyId,
+    }
+}
+
+/// Like [`verify_and_resolve_with_replay`], but keyed by a [`KeyResolver`].
+pub fn verify_and_resolve_with_keys(
+    id: &WorkloadId,
+    keys: &dyn KeyResolver,
+    opts: &VerifyOptions,
+    replay_guard: Option<&mut dyn ReplayGuard>,
+) -> Result<VerifiedIdentity, IdentityError> {
+    match keys.resolve(&id.kid) {
+        Some(secret) => {
+            // Clone the secret out so the resolver borrow doesn't outlive here.
+            let secret = secret.to_vec();
+            verify_and_resolve_with_replay(id, &secret, opts, replay_guard)
+        }
+        None => Err(IdentityError::Assessment {
+            result: AssessmentResult::UnknownKeyId,
+            detail: format!("no key for kid {:?}", id.kid),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +538,55 @@ mod tests {
         assert!(!id.jti.is_empty());
         // jti should be a valid UUID
         assert!(id.jti.parse::<Uuid>().is_ok());
+    }
+
+    // -- key rotation (Phase 5) ------------------------------------------
+
+    fn id_with_kid(kid: &str, secret: &[u8]) -> WorkloadId {
+        let opts = CreateOptions { kid: kid.to_string(), ..default_opts() };
+        create_identity("bot", "host-1", secret, &opts).unwrap()
+    }
+
+    #[test]
+    fn verifies_under_primary_key() {
+        let id = id_with_kid("v2", SECRET);
+        let keys = KeySet::new("v2", SECRET.to_vec());
+        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::Valid);
+    }
+
+    #[test]
+    fn verifies_under_legacy_key_during_overlap() {
+        // Claim signed under the outgoing key v1; verifier has rotated to v2
+        // but keeps v1 live as legacy.
+        let id = id_with_kid("v1", SECRET);
+        let keys = KeySet::new("v2", b"new-primary".to_vec()).with_legacy("v1", SECRET.to_vec());
+        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::Valid);
+    }
+
+    #[test]
+    fn unknown_kid_is_refused_not_signature_failure() {
+        let id = id_with_kid("v1", SECRET);
+        // Verifier has dropped v1 entirely.
+        let keys = KeySet::new("v2", b"new-primary".to_vec());
+        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::UnknownKeyId);
+    }
+
+    #[test]
+    fn known_kid_wrong_secret_is_invalid_signature() {
+        let id = id_with_kid("v2", SECRET);
+        // kid matches but the secret is wrong → signature failure, distinct
+        // from "we don't hold that key."
+        let keys = KeySet::new("v2", b"wrong".to_vec());
+        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::InvalidSignature);
+    }
+
+    #[test]
+    fn single_key_resolver_only_matches_its_kid() {
+        let id = id_with_kid("default", SECRET);
+        let keys = SingleKey::default_kid(SECRET.to_vec());
+        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::Valid);
+        let other = SingleKey::new("other", SECRET.to_vec());
+        assert_eq!(verify_identity_with_keys(&id, &other, &default_verify()), AssessmentResult::UnknownKeyId);
     }
 
     #[test]

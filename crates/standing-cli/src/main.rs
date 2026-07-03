@@ -1,12 +1,15 @@
 use clap::{Parser, Subcommand};
-use standing_grant::{ActorContext, GrantMachine, GrantRequest, GrantScope, Principal};
+use standing_grant::{
+    ActorContext, AssertionGrantMachine, AssertionGrantRequest, AssertionGrantState, AssertionScope,
+    GrantMachine, GrantRequest, GrantScope, Principal, RequestProof,
+};
 use standing_identity::{WorkloadId, verify_and_resolve, verify_and_resolve_with_replay, CreateOptions, ReplayGuard, VerifyOptions};
 use standing_policy::{
     check_assert, AssertCheckRequest, DenyAllResolver, EffectClass, HardcodedPolicy,
     LocalOnlyResolver, PolicyEvaluator, ResolverMode, StandingRequest, StandingResolver,
     StaticConfig, StaticConfigResolver, Verdict,
 };
-use standing_store::{GrantMeta, Store};
+use standing_store::{AssertionGrantMeta, GrantMeta, Store};
 
 #[derive(Parser)]
 #[command(name = "standing", about = "Standing/entitlement observability")]
@@ -55,6 +58,56 @@ enum Commands {
         #[command(subcommand)]
         action: AssertAction,
     },
+    /// Policy-level freezes (incident mode): deny a grant class without
+    /// revoking individual grants. See docs/lifecycle-freeze.md.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Freeze a grant class (deny-overlay). Requires an operator identity.
+    Freeze {
+        /// Incident handle / freeze id (citable).
+        #[arg(long)]
+        handle: String,
+        /// What to freeze on: claim_kind | actor | audience
+        #[arg(long, name = "class-type")]
+        class_type: String,
+        #[arg(long, name = "class-value")]
+        class_value: String,
+        /// Optionally screen only this audience (a freeze scoped to B does not
+        /// screen B').
+        #[arg(long)]
+        audience: Option<String>,
+        #[arg(long)]
+        reason: String,
+        /// Optional lazy-expiry (RFC 3339). After this the freeze stops
+        /// matching — a deny-overlay predicate, not a scheduler; no auto-thaw.
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        secret: String,
+    },
+    /// Lift a freeze (explicit thaw). Same grant class is authorizable again
+    /// with no re-issue.
+    Thaw {
+        #[arg(long)]
+        handle: String,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        secret: String,
+    },
+    /// List freezes (active by default; `--all` includes thawed).
+    ListFreezes {
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -77,6 +130,126 @@ enum AssertAction {
         /// Effect class: descriptive | advisory | binding | mutating
         #[arg(long)]
         effect: String,
+    },
+    /// Open an assertion lease (entitlement-to-assert, Phase 4b). Requires a
+    /// genesis to be installed (the prior settlement-witness). Bind it to a
+    /// verified identity; scope it by claim_kind × subject_scope × audience;
+    /// bound it by a validity window and a use budget.
+    Grant {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        secret: String,
+        #[arg(long, name = "claim-kind")]
+        claim_kind: String,
+        /// Coverage pattern (exact or trailing-`/*`), e.g. "labelwatch/*"
+        #[arg(long, name = "subject-scope")]
+        subject_scope: String,
+        #[arg(long)]
+        audience: String,
+        /// Front of the validity window (RFC 3339). Defaults to now.
+        #[arg(long, name = "not-before")]
+        not_before: Option<String>,
+        /// Lease duration in seconds from not_before.
+        #[arg(long, default_value_t = 3600)]
+        duration: u64,
+        /// Use-count budget (the certified-sound bounded middle, L1).
+        #[arg(long, name = "max-uses")]
+        max_uses: Option<u64>,
+        /// Opt into an UNBOUNDED lease. Not certified sound (kind-scope
+        /// laundering surface); the decision surface stamps it as such.
+        #[arg(long)]
+        unbounded: bool,
+    },
+    /// Activate a lease (Issued → Active). Optional — the first `prove`
+    /// auto-activates.
+    Activate {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        secret: String,
+    },
+    /// Revoke a lease (terminal).
+    Revoke {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        secret: String,
+        /// Act as admin rather than the bound subject.
+        #[arg(long)]
+        admin: bool,
+        #[arg(long)]
+        reason: String,
+    },
+    /// List assertion leases.
+    List {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        audience: Option<String>,
+    },
+    /// Spend a lease once (the RequestProof per-request path). Records a
+    /// single-use jti and emits an AssertionMade receipt.
+    Prove {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        secret: String,
+        #[arg(long, name = "claim-kind")]
+        claim_kind: String,
+        /// Concrete subject id (matched against the lease's subject_scope).
+        #[arg(long, name = "subject-id")]
+        subject_id: String,
+        #[arg(long)]
+        audience: String,
+        /// Single-use replay nonce (unique per audience).
+        #[arg(long)]
+        jti: String,
+        /// SHA-256 of the request body this assertion attests to.
+        #[arg(long, name = "body-digest")]
+        body_digest: Option<String>,
+        /// Use the MAC-verified path: sign the proof with --secret (the shared
+        /// audience key) and verify it, with clock-window enforcement. Without
+        /// this, the spend trusts the transport (no per-request MAC).
+        #[arg(long)]
+        mac: bool,
+    },
+    /// Resolve a binding preflight against a lease: returns the four-variant
+    /// decision (RequiredAndAvailable / RequiredButDenied / ...). `--preview`
+    /// is a dry run that authorizes nothing; without it, the spend path runs.
+    Resolve {
+        #[arg(long)]
+        principal: String,
+        #[arg(long)]
+        consumer: String,
+        #[arg(long, name = "claim-kind")]
+        claim_kind: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        effect: String,
+        /// Lease id to resolve against.
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        secret: String,
+        #[arg(long, name = "subject-id")]
+        subject_id: String,
+        #[arg(long)]
+        jti: String,
+        #[arg(long, name = "body-digest")]
+        body_digest: Option<String>,
+        /// Dry run: check availability without recording or authorizing.
+        #[arg(long)]
+        preview: bool,
     },
 }
 
@@ -186,6 +359,10 @@ enum GrantAction {
         /// Duration in seconds
         #[arg(long, default_value = "300")]
         duration: u64,
+        /// Optional front of the validity window (RFC 3339). The grant cannot
+        /// activate or be used before this time. Defaults to immediate.
+        #[arg(long, name = "not-before")]
+        not_before: Option<String>,
     },
     /// Activate an issued grant
     Activate {
@@ -281,6 +458,7 @@ fn main() {
         Commands::Resolver { action } => handle_resolver(action),
         Commands::Genesis { action } => handle_genesis(&cli.db, action),
         Commands::Assert { action } => handle_assert(&cli.db, action),
+        Commands::Policy { action } => handle_policy(&cli.db, action),
     };
 
     if let Err(e) = result {
@@ -377,10 +555,20 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
             action,
             target,
             duration,
+            not_before,
         } => {
             // Replay guard on grant request: same identity assertion
             // cannot request two grants. Fresh identity per request.
             let (principal, _wid) = resolve_identity(&identity, &secret, Some(&mut replay_guard))?;
+
+            let not_before = match not_before {
+                Some(s) => Some(
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map_err(|e| format!("bad --not-before: {e}"))?
+                        .to_utc(),
+                ),
+                None => None,
+            };
 
             let req = GrantRequest {
                 subject: principal.clone(),
@@ -389,10 +577,14 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                     target: target.clone(),
                 },
                 duration_secs: duration,
+                not_before,
                 context: serde_json::json!({}),
             };
 
-            let mut machine = GrantMachine::request(&req)?;
+            // Root the chain at the instance genesis when one exists, so the
+            // walk terminates AT the operator-fiat root, not beside it.
+            let genesis_root = store.get_genesis()?.map(|g| g.digest);
+            let mut machine = GrantMachine::request_rooted(&req, genesis_root.as_deref())?;
             let grant_id = machine.grant_id();
 
             let requested_receipt = machine.chain.tip().clone();
@@ -407,6 +599,7 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                     target: target.clone(),
                     issued_at: None,
                     expires_at: None,
+                    not_before,
                 }),
             )?;
 
@@ -428,6 +621,7 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                     let grant = machine.grant.as_ref().unwrap();
                     let issued_at = grant.issued_at;
                     let expires_at = grant.expires_at;
+                    let grant_not_before = grant.not_before;
                     store.record_transition(
                         grant_id,
                         &state,
@@ -439,6 +633,7 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                             target,
                             issued_at: Some(issued_at),
                             expires_at: Some(expires_at),
+                            not_before: grant_not_before,
                         }),
                     )?;
                     println!("granted {grant_id}");
@@ -594,10 +789,10 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
 
             for g in &grants {
                 // Only sweep non-terminal grants with an expiry in the past
-                if g.state == "issued" || g.state == "active" {
-                    if let Some(ref exp_str) = g.expires_at {
-                        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp_str) {
-                            if now >= exp.to_utc() {
+                if (g.state == "issued" || g.state == "active")
+                    && let Some(ref exp_str) = g.expires_at
+                        && let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp_str)
+                            && now >= exp.to_utc() {
                                 if dry_run {
                                     println!(
                                         "would expire: {} {} {} → {} (expired {})",
@@ -623,9 +818,6 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                                 }
                                 expired_count += 1;
                             }
-                        }
-                    }
-                }
             }
 
             if expired_count == 0 {
@@ -667,17 +859,15 @@ fn print_actor_from_evidence(evidence_str: &str) {
                 }
                 println!();
             }
-            if let Some(label) = actor.get("label") {
-                if label.as_str() != actor.get("principal_id").and_then(|v| v.as_str()) {
+            if let Some(label) = actor.get("label")
+                && label.as_str() != actor.get("principal_id").and_then(|v| v.as_str()) {
                     println!("    label:  {label}");
                 }
-            }
         }
-        if let Some(detail) = ev.get("detail") {
-            if !detail.is_null() && detail != &serde_json::Value::Object(serde_json::Map::new()) {
+        if let Some(detail) = ev.get("detail")
+            && !detail.is_null() && detail != &serde_json::Value::Object(serde_json::Map::new()) {
                 println!("    detail: {detail}");
             }
-        }
     }
 }
 
@@ -735,7 +925,7 @@ fn handle_resolver(action: ResolverAction) -> Result<(), Box<dyn std::error::Err
                 "deny_all" => DenyAllResolver::new(mode).assess(&request)?,
                 "local_only" => LocalOnlyResolver::new(mode).assess(&request)?,
                 "static_config" => {
-                    let path = config.ok_or_else(|| {
+                    let path = config.ok_or({
                         "static_config resolver requires --config <path-to-toml>"
                     })?;
                     let cfg = StaticConfig::load(std::path::Path::new(&path))?;
@@ -777,27 +967,25 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                 if let Some(ref ph) = r.policy_hash {
                     println!("      policy: {ph}");
                 }
-                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence) {
-                    if !ev.is_null() {
+                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence)
+                    && !ev.is_null() {
                         // Show structured actor/subject if present
-                        if let Some(actor) = ev.get("actor") {
-                            if let Some(pid) = actor.get("principal_id") {
+                        if let Some(actor) = ev.get("actor")
+                            && let Some(pid) = actor.get("principal_id") {
                                 print!("      principal: {pid}");
                                 if let Some(role) = actor.get("role") {
                                     print!(" (role: {role})");
                                 }
                                 println!();
                             }
-                        }
                         if let Some(sid) = ev.get("subject_id") {
                             println!("      subject: {sid}");
                         }
                         // Show detail (the user-provided evidence)
-                        if let Some(detail) = ev.get("detail") {
-                            if !detail.is_null() {
+                        if let Some(detail) = ev.get("detail")
+                            && !detail.is_null() {
                                 println!("      detail: {detail}");
                             }
-                        }
                         // For receipts without the actor/subject structure, show raw
                         if ev.get("actor").is_none() {
                             println!(
@@ -809,8 +997,19 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                             );
                         }
                     }
-                }
                 println!();
+            }
+
+            // If the chain's first receipt is parented to this instance's
+            // genesis, say so — the walk terminates AT the operator-fiat root.
+            if let Some(root_parent) = chain.first().and_then(|r| r.parent_digest.as_ref())
+                && let Some(g) = store.get_genesis()?
+            {
+                if &g.digest == root_parent {
+                    println!("  ✓ chain cryptographically rooted at genesis {}", g.digest);
+                } else {
+                    println!("  root parent {root_parent} is not this instance's genesis");
+                }
             }
         }
         QueryAction::Why { id } => {
@@ -861,11 +1060,10 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                         println!("\n  grant denied:");
                         println!("    digest: {}", r.digest);
                         println!("    time:   {}", r.timestamp);
-                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence) {
-                            if let Some(reason) = ev.get("reason") {
+                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence)
+                            && let Some(reason) = ev.get("reason") {
                                 println!("    reason: {reason}");
                             }
-                        }
                     }
                     "grant_activated" | "grant_used" | "grant_revoked" | "grant_expired" | "grant_abandoned" => {
                         println!("\n  {}:", r.kind.replace('_', " "));
@@ -877,10 +1075,10 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                 }
             }
 
-            // Footer the chain at the named genesis root if one exists.
-            // Grant receipts are not cryptographically parented to genesis in
-            // the MVP, but the policy authority every decision under this
-            // instance derived from terminates here, citably, not in silence.
+            // Footer the chain at the named genesis root if one exists. Grants
+            // created after a genesis is installed are cryptographically
+            // parented to it (the first receipt's parent_digest IS the genesis
+            // digest); the walk terminates here, citably, not in silence.
             print_genesis_footer(&store)?;
         }
     }
@@ -1026,5 +1224,370 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
+
+        AssertAction::Grant {
+            identity,
+            secret,
+            claim_kind,
+            subject_scope,
+            audience,
+            not_before,
+            duration,
+            max_uses,
+            unbounded,
+        } => {
+            // Use budget is mandatory: pick the certified-sound bounded middle
+            // (--max-uses) or consciously opt into the unbounded frontier (L1).
+            let max_uses = match (max_uses, unbounded) {
+                (Some(n), false) => Some(n),
+                (None, true) => None,
+                (Some(_), true) => {
+                    return Err("pass either --max-uses N or --unbounded, not both".into())
+                }
+                (None, false) => {
+                    return Err("assertion leases require a use budget: pass --max-uses N \
+                                (certified sound) or --unbounded (opt into the kind-scope \
+                                laundering surface, L1)"
+                        .into())
+                }
+            };
+
+            let mut store = Store::open(db_path)?;
+            // Issuance requires a prior settlement-witness (L4): fail closed.
+            let genesis = store.get_genesis()?.ok_or(
+                "no genesis installed; run `standing genesis install` first \
+                 (assertion issuance requires a settlement-witness)",
+            )?;
+
+            let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
+            let not_before = match not_before {
+                Some(s) => chrono::DateTime::parse_from_rfc3339(&s)
+                    .map_err(|e| format!("bad --not-before: {e}"))?
+                    .to_utc(),
+                None => chrono::Utc::now(),
+            };
+
+            let req = AssertionGrantRequest {
+                actor: principal.clone(),
+                scope: AssertionScope {
+                    claim_kind: claim_kind.clone(),
+                    subject_scope: subject_scope.clone(),
+                    audience: audience.clone(),
+                },
+                not_before,
+                duration_secs: duration,
+                max_uses,
+                context: serde_json::json!({}),
+            };
+
+            // Root the lease chain at genesis (issuance also cites it as
+            // settlement_witness; this makes the first receipt a parent link).
+            let mut machine = AssertionGrantMachine::request_rooted(&req, Some(&genesis.digest))?;
+            let grant_id = machine.grant_id();
+            let requested = machine.chain.tip().clone();
+            store.record_assertion_transition(
+                grant_id,
+                &machine.state,
+                &requested,
+                Some(AssertionGrantMeta {
+                    actor: principal.id.clone(),
+                    claim_kind: claim_kind.clone(),
+                    subject_scope: subject_scope.clone(),
+                    audience: audience.clone(),
+                    not_before: Some(not_before),
+                    issued_at: None,
+                    expires_at: None,
+                    max_uses,
+                }),
+            )?;
+
+            let policy_hash = genesis.policy_hash.clone().unwrap_or_default();
+            machine.issue(
+                &genesis.digest,
+                &policy_hash,
+                serde_json::json!({ "basis": "operator_issued_under_genesis" }),
+            )?;
+            let issued = machine.chain.tip().clone();
+            let grant = machine.grant.as_ref().unwrap().clone();
+            store.record_assertion_transition(
+                grant_id,
+                &machine.state,
+                &issued,
+                Some(AssertionGrantMeta {
+                    actor: principal.id.clone(),
+                    claim_kind,
+                    subject_scope,
+                    audience,
+                    not_before: Some(grant.not_before),
+                    issued_at: Some(grant.issued_at),
+                    expires_at: Some(grant.expires_at),
+                    max_uses,
+                }),
+            )?;
+
+            println!("assertion lease granted {grant_id}");
+            println!("  actor: {}", principal.id);
+            println!(
+                "  scope: {}:{} @ {}",
+                grant.scope.claim_kind, grant.scope.subject_scope, grant.scope.audience
+            );
+            println!(
+                "  window: {} .. {}",
+                grant.not_before.to_rfc3339(),
+                grant.expires_at.to_rfc3339()
+            );
+            match max_uses {
+                Some(n) => println!("  budget: {n} uses (bounded — certified sound)"),
+                None => println!("  budget: UNBOUNDED (kind-scope; NOT certified sound, L1)"),
+            }
+            println!("  settlement_witness (genesis): {}", genesis.digest);
+            println!("  receipt: {}", issued.digest);
+            Ok(())
+        }
+
+        AssertAction::Activate {
+            id,
+            identity,
+            secret,
+        } => {
+            let mut store = Store::open(db_path)?;
+            let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
+            let ctx = ActorContext::subject(principal);
+            let r = store.transition_assertion(
+                &id,
+                AssertionGrantState::Active,
+                standing_receipt::ReceiptKind::AssertionGrantActivated,
+                &ctx,
+                serde_json::json!({}),
+                None,
+                chrono::Utc::now(),
+            )?;
+            println!("activated {id}");
+            println!("  receipt: {}", r.digest);
+            Ok(())
+        }
+
+        AssertAction::Revoke {
+            id,
+            identity,
+            secret,
+            admin,
+            reason,
+        } => {
+            let mut store = Store::open(db_path)?;
+            let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
+            let ctx = if admin {
+                ActorContext::admin(principal)
+            } else {
+                ActorContext::subject(principal)
+            };
+            let r = store.transition_assertion(
+                &id,
+                AssertionGrantState::Revoked,
+                standing_receipt::ReceiptKind::AssertionGrantRevoked,
+                &ctx,
+                serde_json::json!({ "reason": reason }),
+                None,
+                chrono::Utc::now(),
+            )?;
+            println!("revoked {id}");
+            println!("  receipt: {}", r.digest);
+            Ok(())
+        }
+
+        AssertAction::List { state, audience } => {
+            let store = Store::open(db_path)?;
+            let rows = store.list_assertion_grants(state.as_deref(), audience.as_deref())?;
+            let out: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "actor": r.actor,
+                        "claim_kind": r.claim_kind,
+                        "subject_scope": r.subject_scope,
+                        "audience": r.audience,
+                        "state": r.state,
+                        "not_before": r.not_before,
+                        "expires_at": r.expires_at,
+                        "max_uses": r.max_uses,
+                        "spend_count": r.spend_count,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            Ok(())
+        }
+
+        AssertAction::Prove {
+            id,
+            identity,
+            secret,
+            claim_kind,
+            subject_id,
+            audience,
+            jti,
+            body_digest,
+            mac,
+        } => {
+            let mut store = Store::open(db_path)?;
+            let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
+            let grant_id =
+                uuid::Uuid::parse_str(&id).map_err(|e| format!("bad --id: {e}"))?;
+            let proof = RequestProof {
+                grant_id,
+                actor: principal.id,
+                claim_kind,
+                subject_id,
+                audience,
+                jti,
+                body_digest,
+                issued_at: chrono::Utc::now(),
+            };
+            let now = chrono::Utc::now();
+            let result = if mac {
+                // Sign with --secret (the shared audience key) and verify.
+                let tag = standing_store::sign_proof(&proof, secret.as_bytes())?;
+                store.spend_assertion_verified(&proof, Some(&tag), secret.as_bytes(), now)?
+            } else {
+                store.spend_assertion(&proof, now)?
+            };
+            if mac {
+                println!("asserted (spend #{}, MAC-verified)", result.spend_seq);
+            } else {
+                println!("asserted (spend #{})", result.spend_seq);
+            }
+            println!("  receipt: {}", result.receipt_digest);
+            if result.exhausted {
+                println!("  lease now EXHAUSTED — use budget spent, re-witness required");
+            }
+            Ok(())
+        }
+
+        AssertAction::Resolve {
+            principal,
+            consumer,
+            claim_kind,
+            target,
+            effect,
+            id,
+            identity,
+            secret,
+            subject_id,
+            jti,
+            body_digest,
+            preview,
+        } => {
+            let effect = parse_effect(&effect)?;
+            let request = AssertCheckRequest::new(&principal, &consumer, &claim_kind, &target, effect)?;
+            let mut store = Store::open(db_path)?;
+            let (verified, _wid) = resolve_identity(&identity, &secret, None)?;
+            let grant_id =
+                uuid::Uuid::parse_str(&id).map_err(|e| format!("bad --id: {e}"))?;
+            let proof = RequestProof {
+                grant_id,
+                actor: verified.id,
+                claim_kind,
+                subject_id,
+                audience: consumer,
+                jti,
+                body_digest,
+                issued_at: chrono::Utc::now(),
+            };
+            let result = if preview {
+                store.resolve_assert_preview(&request, &proof, chrono::Utc::now())?
+            } else {
+                store.resolve_assert_spend(&request, &proof, chrono::Utc::now())?
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+    }
+}
+
+fn handle_policy(db_path: &str, action: PolicyAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        PolicyAction::Freeze {
+            handle,
+            class_type,
+            class_value,
+            audience,
+            reason,
+            until,
+            identity,
+            secret,
+        } => {
+            if !["claim_kind", "actor", "audience"].contains(&class_type.as_str()) {
+                return Err(format!(
+                    "unknown --class-type {class_type:?} (expected: claim_kind | actor | audience)"
+                )
+                .into());
+            }
+            let mut store = Store::open(db_path)?;
+            let (op, _wid) = resolve_identity(&identity, &secret, None)?;
+            let until = match until {
+                Some(s) => Some(
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map_err(|e| format!("bad --until: {e}"))?
+                        .to_utc(),
+                ),
+                None => None,
+            };
+            let r = store.install_freeze(
+                &handle, &class_type, &class_value, audience.as_deref(), &reason, until,
+                &op.id, chrono::Utc::now(),
+            )?;
+            println!("frozen {handle}");
+            println!("  class: {class_type}={class_value}");
+            if let Some(a) = &audience {
+                println!("  audience_scope: {a}");
+            }
+            println!("  reason: {reason}");
+            println!("  receipt: {}", r.digest);
+            Ok(())
+        }
+        PolicyAction::Thaw { handle, identity, secret } => {
+            let mut store = Store::open(db_path)?;
+            let (op, _wid) = resolve_identity(&identity, &secret, None)?;
+            let r = store.thaw_freeze(&handle, &op.id, chrono::Utc::now())?;
+            println!("thawed {handle}");
+            println!("  receipt: {}", r.digest);
+            Ok(())
+        }
+        PolicyAction::ListFreezes { all } => {
+            let store = Store::open(db_path)?;
+            let rows = store.list_freezes(!all)?;
+            let out: Vec<_> = rows
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "handle": f.handle,
+                        "class_type": f.class_type,
+                        "class_value": f.class_value,
+                        "audience_scope": f.audience_scope,
+                        "reason": f.reason,
+                        "frozen_at": f.frozen_at,
+                        "frozen_until": f.frozen_until,
+                        "thawed_at": f.thawed_at,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            Ok(())
+        }
+    }
+}
+
+/// Parse an effect-class string into an [`EffectClass`], with a helpful error.
+fn parse_effect(effect: &str) -> Result<EffectClass, Box<dyn std::error::Error>> {
+    match effect {
+        "descriptive" => Ok(EffectClass::Descriptive),
+        "advisory" => Ok(EffectClass::Advisory),
+        "binding" => Ok(EffectClass::Binding),
+        "mutating" => Ok(EffectClass::Mutating),
+        other => Err(format!(
+            "unknown effect: {other:?} (expected: descriptive | advisory | binding | mutating)"
+        )
+        .into()),
     }
 }

@@ -151,6 +151,7 @@ mod tests {
                 target: target.to_string(),
             },
             duration_secs: duration,
+            not_before: None,
             context: serde_json::json!({}),
         }
     }

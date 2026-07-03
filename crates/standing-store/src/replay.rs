@@ -1,8 +1,14 @@
 //! SQLite-backed replay guard for identity jti tracking.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection};
 use standing_identity::ReplayGuard;
+
+/// Grace period past `expires_at` before a seen-jti entry is purgeable. Keeping
+/// an entry a little past its expiry closes a replay window at the boundary:
+/// with disagreeing clocks, a just-expired jti could otherwise be purged and
+/// then re-presented. Matches the identity layer's skew tolerance.
+const PURGE_SKEW_SECS: i64 = 30;
 
 /// SQLite replay guard: stores seen jti+audience pairs with expiry.
 ///
@@ -48,10 +54,12 @@ impl ReplayGuard for SqliteReplayGuard<'_> {
     }
 
     fn purge_expired(&mut self) -> Result<u64, String> {
-        let now = Utc::now().to_rfc3339();
+        // Only purge entries expired MORE than the skew grace ago, so a
+        // just-expired jti stays defended across a clock disagreement.
+        let cutoff = (Utc::now() - Duration::seconds(PURGE_SKEW_SECS)).to_rfc3339();
         let result = self
             .conn
-            .execute("DELETE FROM seen_jti WHERE expires_at < ?1", params![now]);
+            .execute("DELETE FROM seen_jti WHERE expires_at < ?1", params![cutoff]);
         match result {
             Ok(rows) => Ok(rows as u64),
             Err(e) => Err(e.to_string()),
@@ -96,21 +104,27 @@ mod tests {
     }
 
     #[test]
-    fn purge_removes_expired() {
+    fn purge_removes_well_expired_but_keeps_recent() {
         let conn = setup();
         let mut guard = SqliteReplayGuard::new(&conn).unwrap();
-        let past = Utc::now() - chrono::Duration::seconds(10);
+        let long_past = Utc::now() - chrono::Duration::seconds(3600);
+        let just_expired = Utc::now() - chrono::Duration::seconds(5); // within skew grace
         let future = Utc::now() + chrono::Duration::seconds(300);
 
-        guard.check_and_record("old", "standing", past).unwrap();
-        guard.check_and_record("new", "standing", future).unwrap();
+        guard.check_and_record("ancient", "standing", long_past).unwrap();
+        guard.check_and_record("just", "standing", just_expired).unwrap();
+        guard.check_and_record("live", "standing", future).unwrap();
 
+        // Only "ancient" (past the skew grace) is purged; "just" is retained
+        // to close the boundary replay window.
         let purged = guard.purge_expired().unwrap();
         assert_eq!(purged, 1);
 
-        // "old" is gone — can be reused (expired anyway)
-        assert!(guard.check_and_record("old", "standing", future).unwrap());
-        // "new" is still there
-        assert!(!guard.check_and_record("new", "standing", future).unwrap());
+        // "ancient" is gone.
+        assert!(guard.check_and_record("ancient", "standing", future).unwrap());
+        // "just" is still defended despite being expired.
+        assert!(!guard.check_and_record("just", "standing", future).unwrap());
+        // "live" is still there.
+        assert!(!guard.check_and_record("live", "standing", future).unwrap());
     }
 }

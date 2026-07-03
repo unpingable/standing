@@ -168,11 +168,10 @@ impl StaticConfigEntry {
         audience: &str,
         now: DateTime<Utc>,
     ) -> Classification {
-        if let Some(exp) = self.expires_at {
-            if now >= exp {
+        if let Some(exp) = self.expires_at
+            && now >= exp {
                 return Classification::Expired;
             }
-        }
         if self.claim_kind != claim_kind {
             return Classification::ClaimKindMismatch;
         }
@@ -186,27 +185,11 @@ impl StaticConfigEntry {
     }
 }
 
-/// Subject-scope matching: exact OR trailing-`*` prefix on `/`-delimited
-/// path segments. `"labelwatch/*"` matches `"labelwatch/foo"` and
-/// `"labelwatch/foo/bar"` but not `"labelwatchx"` and not `"labelwatch"`
-/// (no segments after the slash).
-///
-/// No regex. No glob beyond a trailing `*`. The `*` must be the last
-/// segment after a `/` — `"a/*/b"` is not a valid pattern and falls back
-/// to exact match (so it will not match anything other than itself).
-pub fn subject_scope_matches(pattern: &str, candidate: &str) -> bool {
-    if pattern == candidate {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        // Candidate must start with "<prefix>/" AND have at least one
-        // character after — empty trailing segment doesn't count.
-        if let Some(rest) = candidate.strip_prefix(prefix) {
-            return rest.starts_with('/') && rest.len() > 1;
-        }
-    }
-    false
-}
+// Subject-scope matching is now defined once in `standing_grant::assertion`
+// (the `kid`-stable canonical definition), shared by the assertion-lease
+// coverage check and this static-config resolver. Re-exported here so existing
+// call sites (`classify`) and tests keep resolving `subject_scope_matches`.
+pub use standing_grant::subject_scope_matches;
 
 #[cfg(test)]
 mod tests {

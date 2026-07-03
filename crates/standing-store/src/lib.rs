@@ -8,14 +8,23 @@
 //! a valid transition. Both are written atomically or neither is.
 
 pub mod replay;
+mod resolve;
+mod store_resolver;
+
+pub use store_resolver::StoreResolver;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Transaction};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use standing_grant::{ActorContext, GrantScope, GrantState, PrincipalRole, auth};
+use standing_grant::{
+    assertion_covers, ActorContext, AssertCoverage, AssertionGrant, AssertionGrantState,
+    AssertionScope, GrantScope, GrantState, Principal, PrincipalRole, RequestProof, WindowState,
+    auth,
+};
 use standing_receipt::{Receipt, ReceiptBuilder, ReceiptKind};
+use chrono::Duration;
 
 /// Errors from the store.
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +50,12 @@ pub enum StoreError {
     #[error("grant expired at {0}")]
     GrantExpired(String),
 
+    #[error("grant not yet valid (not_before {0})")]
+    GrantNotYetValid(String),
+
+    #[error("grant expiry timestamp is unparseable ({0}); refusing rather than treating an unreadable expiry as valid")]
+    GrantTimeUnparseable(String),
+
     #[error("scope mismatch: grant authorizes {granted}, attempted {attempted}")]
     ScopeMismatch { granted: String, attempted: String },
 
@@ -53,6 +68,49 @@ pub enum StoreError {
 
     #[error("genesis already installed for this instance (digest {0}); a second install would contradict the chain root")]
     GenesisExists(String),
+
+    // -- assertion-lease (Phase 4b) --------------------------------------
+    #[error("assertion grant not found: {0}")]
+    AssertionGrantNotFound(String),
+
+    #[error("assertion out of lease scope: {axis}")]
+    AssertionOutOfScope { axis: String },
+
+    #[error("assertion lease window closed (expired at {0})")]
+    AssertionWindowClosed(String),
+
+    #[error("assertion lease not yet valid (not_before {0})")]
+    AssertionNotYetValid(String),
+
+    #[error("assertion lease window is incoherent or its stored timestamps are unparseable; refusing rather than guessing")]
+    AssertionWindowIncoherent,
+
+    #[error("assertion lease use budget exhausted (max_uses {max_uses})")]
+    AssertionBudgetExhausted { max_uses: u64 },
+
+    #[error("replay detected: jti {jti} already seen for audience {audience}")]
+    ReplayDetected { jti: String, audience: String },
+
+    #[error("assertion proof MAC invalid or missing — the per-request envelope is not authentic")]
+    AssertionMacInvalid,
+
+    #[error("assertion proof clock skew exceeded: issued_at is {0}s in the future beyond tolerance")]
+    ClockSkewExceeded(i64),
+
+    #[error("assertion proof timestamp out of window: {0}s old, beyond the freshness horizon")]
+    RequestTimestampOutOfWindow(i64),
+
+    #[error("cannot issue an assertion lease with no genesis installed; issuance requires a prior settlement-witness")]
+    AssertionNoGenesis,
+
+    #[error("class frozen: {handle} ({reason})")]
+    ClassFrozen { handle: String, reason: String },
+
+    #[error("freeze {0} already exists")]
+    FreezeExists(String),
+
+    #[error("freeze {0} not found")]
+    FreezeNotFound(String),
 }
 
 /// The standing store.
@@ -111,6 +169,7 @@ impl Store {
                 state TEXT NOT NULL,
                 issued_at TEXT,
                 expires_at TEXT,
+                not_before TEXT,
                 latest_receipt_digest TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -125,6 +184,63 @@ impl Store {
             -- was established by this operator on this date under this policy.'
             CREATE UNIQUE INDEX IF NOT EXISTS uniq_genesis
                 ON receipts(kind) WHERE kind = 'genesis_install';
+
+            -- Assertion leases (entitlement-to-assert, Phase 4b). A lease is
+            -- reusable (spent many times) but budget-bounded (max_uses, L1) and
+            -- window-bounded (not_before/expires_at, L2).
+            CREATE TABLE IF NOT EXISTS assertion_grants (
+                id TEXT PRIMARY KEY,
+                actor TEXT NOT NULL,
+                claim_kind TEXT NOT NULL,
+                subject_scope TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                state TEXT NOT NULL,
+                not_before TEXT,
+                issued_at TEXT,
+                expires_at TEXT,
+                max_uses INTEGER,
+                spend_count INTEGER NOT NULL DEFAULT 0,
+                latest_receipt_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agrants_actor ON assertion_grants(actor);
+            CREATE INDEX IF NOT EXISTS idx_agrants_audience ON assertion_grants(audience);
+            CREATE INDEX IF NOT EXISTS idx_agrants_state ON assertion_grants(state);
+
+            -- Per-request replay ledger for assertion spends. Keyed on
+            -- (jti, audience) exactly like seen_jti, but a SEPARATE namespace:
+            -- assertion-proof jtis have a different lifetime (bounded by the
+            -- lease window) and a different failure meaning than identity jtis.
+            -- Merging the two risks a cross-namespace collision masking a real
+            -- replay.
+            CREATE TABLE IF NOT EXISTS seen_assertion_jti (
+                jti TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (jti, audience)
+            );
+            CREATE INDEX IF NOT EXISTS idx_seen_ajti_expires ON seen_assertion_jti(expires_at);
+
+            -- Policy-level freezes (incident mode, docs/lifecycle-freeze.md).
+            -- A freeze is a deny-overlay on a grant CLASS, not a change to any
+            -- grant record. Frozen leases keep counting clock-time toward
+            -- expiry (freeze is a deny-overlay, not a stop-clock).
+            CREATE TABLE IF NOT EXISTS policy_freezes (
+                handle TEXT PRIMARY KEY,      -- incident handle / freeze id
+                class_type TEXT NOT NULL,     -- claim_kind | action | actor | audience
+                class_value TEXT NOT NULL,
+                audience_scope TEXT,          -- optional: screen only this audience
+                reason TEXT NOT NULL,
+                frozen_at TEXT NOT NULL,
+                frozen_until TEXT,            -- optional lazy-expiry (deny-overlay predicate)
+                thawed_at TEXT,               -- set on explicit thaw
+                freeze_receipt TEXT NOT NULL,
+                thaw_receipt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_freezes_class ON policy_freezes(class_type, class_value);
             ",
         )?;
         Ok(())
@@ -235,13 +351,14 @@ impl Store {
 
         if let Some(meta) = grant_meta {
             tx.execute(
-                "INSERT INTO grants (id, subject_id, actor, action, target, state, issued_at, expires_at, latest_receipt_digest, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                "INSERT INTO grants (id, subject_id, actor, action, target, state, issued_at, expires_at, not_before, latest_receipt_digest, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
                  ON CONFLICT(id) DO UPDATE SET
                     state = ?6,
                     issued_at = COALESCE(?7, grants.issued_at),
                     expires_at = COALESCE(?8, grants.expires_at),
-                    latest_receipt_digest = ?9,
+                    not_before = COALESCE(?9, grants.not_before),
+                    latest_receipt_digest = ?10,
                     updated_at = datetime('now')",
                 params![
                     grant_id.to_string(),
@@ -252,6 +369,7 @@ impl Store {
                     state_str,
                     meta.issued_at.map(|t| t.to_rfc3339()),
                     meta.expires_at.map(|t| t.to_rfc3339()),
+                    meta.not_before.map(|t| t.to_rfc3339()),
                     receipt.digest,
                 ],
             )?;
@@ -409,7 +527,7 @@ impl Store {
         // Step 1: Read current state (inside transaction for isolation)
         let grant = {
             let mut stmt = tx.prepare(
-                "SELECT state, latest_receipt_digest, subject_id, expires_at, action, target FROM grants WHERE id = ?1",
+                "SELECT state, latest_receipt_digest, subject_id, expires_at, action, target, not_before FROM grants WHERE id = ?1",
             )?;
             let mut rows = stmt.query_map(params![grant_id], |row| {
                 Ok(GrantSnapshot {
@@ -419,6 +537,7 @@ impl Store {
                     expires_at: row.get::<_, Option<String>>(3)?,
                     action: row.get::<_, String>(4)?,
                     target: row.get::<_, String>(5)?,
+                    not_before: row.get::<_, Option<String>>(6)?,
                 })
             })?;
             match rows.next() {
@@ -468,23 +587,59 @@ impl Store {
         // refuses without spending (the grant stays unspent — non-consuming, so a
         // wrong-target presentation cannot burn a single-use grant). Standing owns this
         // refusal; a consumer adapting the grant inherits it rather than inventing it.
-        if let Some(att) = attempted_scope {
-            if att.action != grant.action || att.target != grant.target {
+        if let Some(att) = attempted_scope
+            && (att.action != grant.action || att.target != grant.target) {
                 return Err(StoreError::ScopeMismatch {
                     granted: format!("{}/{}", grant.action, grant.target),
                     attempted: format!("{}/{}", att.action, att.target),
                 });
             }
+
+        // Step 3d: Policy freeze (incident mode). An authorizing transition
+        // (Active/Used) on a frozen action/actor class is refused with
+        // class_frozen — before any write (non-consuming), and the grant record
+        // is untouched (deny-overlay, not a state change). Audience-scoped
+        // freezes don't apply to act-grants (they carry no audience).
+        if matches!(target_state, GrantState::Active | GrantState::Used) {
+            if let Some(f) = find_active_freeze(&tx, Utc::now(), |f| {
+                f.audience_scope.is_none()
+                    && match f.class_type.as_str() {
+                        "action" => f.class_value == grant.action,
+                        "actor" => f.class_value == grant.subject_id,
+                        _ => false,
+                    }
+            })? {
+                return Err(StoreError::ClassFrozen { handle: f.handle, reason: f.reason });
+            }
+        }
+
+        // Step 3e: not_before window. An authorizing transition before the
+        // grant's validity window opens is refused (fail-closed on unparseable
+        // time, same discipline as expiry).
+        if matches!(target_state, GrantState::Active | GrantState::Used) {
+            if let Some(ref nb_str) = grant.not_before {
+                let nb = DateTime::parse_from_rfc3339(nb_str)
+                    .map(|t| t.to_utc())
+                    .map_err(|_| StoreError::GrantTimeUnparseable(nb_str.clone()))?;
+                if Utc::now() < nb {
+                    return Err(StoreError::GrantNotYetValid(nb_str.clone()));
+                }
+            }
         }
 
         // Step 4: Contextual guards
-        // Expiry check: if grant has an expires_at and it's in the past,
-        // the only valid transition is to Expired (not Used, not Active)
+        // Expiry check: if grant has an expires_at and it's in the past
+        // (beyond skew tolerance), the only valid transition is to Expired.
+        // Fail-closed on an unparseable timestamp — an expiry we cannot read
+        // is unknown, and unknown must not silently pass (the clock-witness
+        // doctrine; the assertion path obeys the same rule).
         if let Some(ref expires_at_str) = grant.expires_at {
-            if let Ok(expires_at) = DateTime::parse_from_rfc3339(expires_at_str) {
-                if Utc::now() >= expires_at.to_utc() && target_state != GrantState::Expired {
-                    return Err(StoreError::GrantExpired(expires_at_str.clone()));
-                }
+            let expires_at = DateTime::parse_from_rfc3339(expires_at_str)
+                .map(|t| t.to_utc())
+                .map_err(|_| StoreError::GrantTimeUnparseable(expires_at_str.clone()))?;
+            let skew = Duration::seconds(GRANT_EXPIRY_SKEW_SECS);
+            if Utc::now() > expires_at + skew && target_state != GrantState::Expired {
+                return Err(StoreError::GrantExpired(expires_at_str.clone()));
             }
         }
 
@@ -568,6 +723,659 @@ impl Store {
     }
 }
 
+/// Clock-skew grace on act-grant expiry, in seconds. A grant one second past
+/// expiry on a slightly-fast verifier clock should not hard-fail; the identity
+/// layer already applies the same tolerance to claims.
+const GRANT_EXPIRY_SKEW_SECS: i64 = 30;
+
+/// Max CAS retries for an assertion spend before giving up (amendment #5).
+/// Different-jti spends serialize on the head digest; the loser re-reads and
+/// retries rather than surfacing a raw stale-head error to the caller.
+const SPEND_CAS_RETRIES: u32 = 5;
+
+/// How far in the future a proof's `issued_at` may be before we call it a clock
+/// disagreement rather than a fresh request (seconds).
+const PROOF_MAX_SKEW_SECS: i64 = 30;
+
+/// How old a proof's `issued_at` may be and still be evaluable (seconds). Past
+/// this, the request is out of the freshness window regardless of MAC validity.
+const PROOF_MAX_AGE_SECS: i64 = 300;
+
+/// Compute the canonical MAC tag for a request proof: HMAC-SHA256 over the
+/// canonical JSON of the proof's fixed signed body (the field set pinned in
+/// Wave 1, amendment #4).
+fn proof_mac(proof: &RequestProof, secret: &[u8]) -> Result<String, StoreError> {
+    let bytes = standing_receipt::canonical_json(&proof.canonical_body())
+        .map_err(StoreError::Json)?;
+    Ok(standing_identity::hmac_hex(secret, &bytes))
+}
+
+impl Store {
+    /// Unchecked setup path for assertion leases (mirror of
+    /// [`Store::record_transition`]). Used by the `assert grant` flow to persist
+    /// the request→issue receipts. Does NOT validate transitions.
+    pub fn record_assertion_transition(
+        &mut self,
+        grant_id: Uuid,
+        state: &AssertionGrantState,
+        receipt: &Receipt,
+        meta: Option<AssertionGrantMeta>,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        insert_receipt(&tx, receipt)?;
+
+        let state_str = state.to_string();
+
+        if let Some(m) = meta {
+            tx.execute(
+                "INSERT INTO assertion_grants
+                    (id, actor, claim_kind, subject_scope, audience, state,
+                     not_before, issued_at, expires_at, max_uses, spend_count,
+                     latest_receipt_digest, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, datetime('now'))
+                 ON CONFLICT(id) DO UPDATE SET
+                    state = ?6,
+                    not_before = COALESCE(?7, assertion_grants.not_before),
+                    issued_at = COALESCE(?8, assertion_grants.issued_at),
+                    expires_at = COALESCE(?9, assertion_grants.expires_at),
+                    max_uses = COALESCE(?10, assertion_grants.max_uses),
+                    latest_receipt_digest = ?11,
+                    updated_at = datetime('now')",
+                params![
+                    grant_id.to_string(),
+                    m.actor,
+                    m.claim_kind,
+                    m.subject_scope,
+                    m.audience,
+                    state_str,
+                    m.not_before.map(|t| t.to_rfc3339()),
+                    m.issued_at.map(|t| t.to_rfc3339()),
+                    m.expires_at.map(|t| t.to_rfc3339()),
+                    m.max_uses.map(|u| u as i64),
+                    receipt.digest,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE assertion_grants SET state = ?1, latest_receipt_digest = ?2, updated_at = datetime('now') WHERE id = ?3",
+                params![state_str, receipt.digest, grant_id.to_string()],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get an assertion lease's current row.
+    pub fn get_assertion_grant(&self, grant_id: &str) -> Result<Option<AssertionGrantRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, actor, claim_kind, subject_scope, audience, state, not_before,
+                    issued_at, expires_at, max_uses, spend_count, latest_receipt_digest
+             FROM assertion_grants WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![grant_id], map_assertion_grant_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List assertion leases, optionally filtered by state and/or audience.
+    pub fn list_assertion_grants(
+        &self,
+        state_filter: Option<&str>,
+        audience_filter: Option<&str>,
+    ) -> Result<Vec<AssertionGrantRow>, StoreError> {
+        let mut sql = String::from(
+            "SELECT id, actor, claim_kind, subject_scope, audience, state, not_before,
+                    issued_at, expires_at, max_uses, spend_count, latest_receipt_digest
+             FROM assertion_grants",
+        );
+        let mut clauses = Vec::new();
+        if state_filter.is_some() {
+            clauses.push("state = :state");
+        }
+        if audience_filter.is_some() {
+            clauses.push("audience = :audience");
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY updated_at DESC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params_vec: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+        if let Some(s) = state_filter.as_ref() {
+            params_vec.push((":state", s));
+        }
+        if let Some(a) = audience_filter.as_ref() {
+            params_vec.push((":audience", a));
+        }
+        let rows = stmt.query_map(params_vec.as_slice(), map_assertion_grant_row)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Checked lifecycle transition for an assertion lease (activate / revoke /
+    /// expire / deny). NOT a spend — see [`Store::spend_assertion`] for the
+    /// `Active → Active` self-loop. Mirrors [`Store::transition`] with CAS.
+    pub fn transition_assertion(
+        &mut self,
+        grant_id: &str,
+        target_state: AssertionGrantState,
+        receipt_kind: ReceiptKind,
+        actor_ctx: &ActorContext,
+        evidence: serde_json::Value,
+        policy_hash: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Receipt, StoreError> {
+        let tx = self.conn.transaction()?;
+        let snap = read_assertion_snapshot(&tx, grant_id)?;
+
+        let current = AssertionGrantState::from_str(&snap.state).ok_or_else(|| {
+            StoreError::InvalidTransition { from: snap.state.clone(), to: target_state.to_string() }
+        })?;
+        if !current.can_transition_to(&target_state) {
+            return Err(StoreError::InvalidTransition {
+                from: current.to_string(),
+                to: target_state.to_string(),
+            });
+        }
+
+        // Subject binding: a Subject actor may only drive its own lease.
+        if actor_ctx.role == PrincipalRole::Subject && actor_ctx.principal.id != snap.actor {
+            return Err(StoreError::Unauthorized {
+                actor: actor_ctx.principal.id.clone(),
+                role: "subject (wrong principal)".to_string(),
+                transition: format!("{} → {}", current, target_state),
+            });
+        }
+
+        // Activation must land inside the validity window (L2). Expire/revoke
+        // are allowed regardless.
+        if target_state == AssertionGrantState::Active {
+            let grant = snapshot_to_grant(&snap, grant_id)?;
+            match grant.window_state(now, Duration::zero()) {
+                WindowState::Within => {}
+                WindowState::NotYetValid => {
+                    return Err(StoreError::AssertionNotYetValid(grant.not_before.to_rfc3339()))
+                }
+                WindowState::Expired => {
+                    return Err(StoreError::AssertionWindowClosed(grant.expires_at.to_rfc3339()))
+                }
+                WindowState::Incoherent => return Err(StoreError::AssertionWindowIncoherent),
+            }
+        }
+
+        let receipt = build_assertion_receipt(
+            receipt_kind,
+            &actor_ctx.principal.id,
+            grant_id,
+            &snap.head_digest,
+            serde_json::json!({
+                "actor": {
+                    "principal_id": actor_ctx.principal.id,
+                    "label": actor_ctx.principal.label,
+                    "role": actor_ctx.role,
+                },
+                "detail": evidence,
+            }),
+            policy_hash,
+        )?;
+
+        insert_receipt(&tx, &receipt)?;
+        let rows = tx.execute(
+            "UPDATE assertion_grants SET state = ?1, latest_receipt_digest = ?2, updated_at = datetime('now')
+             WHERE id = ?3 AND latest_receipt_digest = ?4",
+            params![target_state.to_string(), receipt.digest, grant_id, snap.head_digest],
+        )?;
+        if rows == 0 {
+            return Err(StoreError::InvalidTransition {
+                from: format!("{} (stale head)", snap.state),
+                to: target_state.to_string(),
+            });
+        }
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    /// Spend an assertion lease once — the `Active → Active` self-loop.
+    ///
+    /// All refusal checks run BEFORE any write (non-consuming on refusal). In
+    /// order: actor binding, scope coverage (L-scope), validity window (L2),
+    /// use budget (L1), then the single-use replay ledger. On success it emits
+    /// an `AssertionMade` receipt (auto-emitting `AssertionGrantActivated` first
+    /// if the lease was still `Issued`, so the chain never shows a spend without
+    /// a prior activation — amendment #3), and, if this spend exhausts the
+    /// budget, an `AssertionGrantExhausted` receipt driving the lease terminal
+    /// (L1). The whole thing is one transaction with a bounded CAS retry on head
+    /// contention (amendment #5); a real replay (`jti` already committed for the
+    /// audience) refuses without retry.
+    pub fn spend_assertion(
+        &mut self,
+        proof: &RequestProof,
+        now: DateTime<Utc>,
+    ) -> Result<AssertionSpendResult, StoreError> {
+        let grant_id = proof.grant_id.to_string();
+
+        // Policy freeze (incident mode): a deny-overlay checked before any
+        // write — non-consuming (L6). The lease is untouched and keeps counting
+        // clock-time toward expiry; the freeze only screens the class.
+        if let Some(f) = self.active_freeze_for(&proof.claim_kind, &proof.actor, &proof.audience, now)? {
+            return Err(StoreError::ClassFrozen { handle: f.handle, reason: f.reason });
+        }
+
+        for _attempt in 0..SPEND_CAS_RETRIES {
+            let tx = self.conn.transaction()?;
+            let snap = read_assertion_snapshot(&tx, &grant_id)?;
+
+            let current = AssertionGrantState::from_str(&snap.state).ok_or_else(|| {
+                StoreError::InvalidTransition { from: snap.state.clone(), to: "active".into() }
+            })?;
+
+            // Must be spendable: Active, or Issued (auto-activate). Anything
+            // else (Requested/terminal) refuses.
+            let needs_activation = match current {
+                AssertionGrantState::Active => false,
+                AssertionGrantState::Issued => true,
+                AssertionGrantState::Exhausted => {
+                    let max = snap.max_uses.unwrap_or(0).max(0) as u64;
+                    return Err(StoreError::AssertionBudgetExhausted { max_uses: max });
+                }
+                other => {
+                    return Err(StoreError::InvalidTransition {
+                        from: other.to_string(),
+                        to: "active (spend)".into(),
+                    })
+                }
+            };
+
+            let grant = snapshot_to_grant(&snap, &grant_id)?;
+
+            // --- refusal checks, all before any write (non-consuming) ---
+
+            if proof.actor != grant.actor.id {
+                return Err(StoreError::AssertionOutOfScope { axis: "actor_mismatch".into() });
+            }
+            match assertion_covers(&grant.scope, &proof.claim_kind, &proof.subject_id, &proof.audience) {
+                AssertCoverage::Covered => {}
+                AssertCoverage::ClaimKindMismatch => {
+                    return Err(StoreError::AssertionOutOfScope { axis: "claim_kind_out_of_scope".into() })
+                }
+                AssertCoverage::SubjectMismatch => {
+                    return Err(StoreError::AssertionOutOfScope { axis: "subject_out_of_scope".into() })
+                }
+                AssertCoverage::AudienceMismatch => {
+                    return Err(StoreError::AssertionOutOfScope { axis: "audience_mismatch".into() })
+                }
+            }
+            match grant.window_state(now, Duration::zero()) {
+                WindowState::Within => {}
+                WindowState::NotYetValid => {
+                    return Err(StoreError::AssertionNotYetValid(grant.not_before.to_rfc3339()))
+                }
+                WindowState::Expired => {
+                    return Err(StoreError::AssertionWindowClosed(grant.expires_at.to_rfc3339()))
+                }
+                WindowState::Incoherent => return Err(StoreError::AssertionWindowIncoherent),
+            }
+            if grant.is_exhausted() {
+                return Err(StoreError::AssertionBudgetExhausted {
+                    max_uses: grant.max_uses.unwrap_or(0),
+                });
+            }
+
+            // --- replay ledger (single-use jti per audience) ---
+            // INSERT OR IGNORE inside this tx: if the row already exists (a
+            // committed prior spend), it's a replay. A CAS-failed retry rolls
+            // this back, so the same logical spend can re-insert on retry.
+            let jti_expires = grant.expires_at.to_rfc3339();
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO seen_assertion_jti (jti, audience, expires_at) VALUES (?1, ?2, ?3)",
+                params![proof.jti, proof.audience, jti_expires],
+            )?;
+            if inserted == 0 {
+                // Real replay — do not retry.
+                return Err(StoreError::ReplayDetected {
+                    jti: proof.jti.clone(),
+                    audience: proof.audience.clone(),
+                });
+            }
+
+            // --- writes, chained to the head ---
+            let mut head = snap.head_digest.clone();
+
+            // Auto-activation emits its own receipt (amendment #3).
+            if needs_activation {
+                let act = build_assertion_receipt(
+                    ReceiptKind::AssertionGrantActivated,
+                    &grant.actor.id,
+                    &grant_id,
+                    &head,
+                    serde_json::json!({ "auto_activated_by_spend": true }),
+                    None,
+                )?;
+                insert_receipt(&tx, &act)?;
+                head = act.digest;
+            }
+
+            let new_seq = snap.spend_count.max(0) as u64 + 1;
+            let issuance_digest = find_issuance_digest(&tx, &grant_id)?.unwrap_or_default();
+            let made = build_assertion_receipt(
+                ReceiptKind::AssertionMade,
+                &grant.actor.id,
+                &grant_id,
+                &head,
+                serde_json::json!({
+                    "version": standing_grant::ASSERTION_MADE_VERSION,
+                    "proof": proof.canonical_body(),
+                    "spend_seq": new_seq,
+                    "authority": issuance_digest,
+                }),
+                None,
+            )?;
+            insert_receipt(&tx, &made)?;
+            head = made.digest.clone();
+
+            // Exhaustion (L1): if this spend hits the budget, drive terminal.
+            let exhausted = matches!(grant.max_uses, Some(m) if new_seq >= m);
+            let (final_state, final_head) = if exhausted {
+                let exh = build_assertion_receipt(
+                    ReceiptKind::AssertionGrantExhausted,
+                    &grant.actor.id,
+                    &grant_id,
+                    &head,
+                    serde_json::json!({ "max_uses": grant.max_uses.unwrap_or(0) }),
+                    None,
+                )?;
+                insert_receipt(&tx, &exh)?;
+                (AssertionGrantState::Exhausted, exh.digest)
+            } else {
+                (AssertionGrantState::Active, head)
+            };
+
+            // --- CAS on the ORIGINAL head; retry on contention ---
+            let rows = tx.execute(
+                "UPDATE assertion_grants
+                    SET state = ?1, latest_receipt_digest = ?2, spend_count = ?3, updated_at = datetime('now')
+                    WHERE id = ?4 AND latest_receipt_digest = ?5",
+                params![
+                    final_state.to_string(),
+                    final_head,
+                    new_seq as i64,
+                    grant_id,
+                    snap.head_digest,
+                ],
+            )?;
+            if rows == 0 {
+                // Head moved between read and write — drop tx (rolls back the
+                // jti insert too) and retry with a fresh snapshot.
+                drop(tx);
+                continue;
+            }
+            tx.commit()?;
+            return Ok(AssertionSpendResult {
+                receipt_digest: made.digest.clone(),
+                spend_seq: new_seq,
+                exhausted,
+                receipt: made,
+            });
+        }
+
+        Err(StoreError::InvalidTransition {
+            from: "assertion_grant (contended head)".into(),
+            to: "active (spend) after retries".into(),
+        })
+    }
+
+    /// Like [`Store::spend_assertion`], but first AUTHENTICATES the per-request
+    /// proof: it checks the proof timestamp against the freshness window and
+    /// verifies the `mac` over the proof's canonical body with `secret`. This is
+    /// the MAC-verified binding path; plain `spend_assertion` trusts the
+    /// transport. Per L5 the MAC must be contemporaneous with the spend — this
+    /// method verifies it at spend time and there is no backfill path.
+    ///
+    /// (Audience-key *distribution* — how a verifier obtains `secret` for a
+    /// given actor/audience — is deliberately out of scope here; the caller
+    /// resolves the key. This method is the verification capability, not the
+    /// distribution layer.)
+    pub fn spend_assertion_verified(
+        &mut self,
+        proof: &RequestProof,
+        mac: Option<&str>,
+        secret: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AssertionSpendResult, StoreError> {
+        // Clock window (fail-closed both directions).
+        let ahead = (proof.issued_at - now).num_seconds();
+        if ahead > PROOF_MAX_SKEW_SECS {
+            return Err(StoreError::ClockSkewExceeded(ahead));
+        }
+        let age = (now - proof.issued_at).num_seconds();
+        if age > PROOF_MAX_AGE_SECS {
+            return Err(StoreError::RequestTimestampOutOfWindow(age));
+        }
+
+        // MAC over the fixed canonical body (constant-time compare).
+        let expected = proof_mac(proof, secret)?;
+        match mac {
+            Some(m) if ct_eq(m, &expected) => {}
+            _ => return Err(StoreError::AssertionMacInvalid),
+        }
+
+        self.spend_assertion(proof, now)
+    }
+}
+
+/// Sign a request proof, producing the MAC a verifier will check. The inverse
+/// of the check inside [`Store::spend_assertion_verified`].
+pub fn sign_proof(proof: &RequestProof, secret: &[u8]) -> Result<String, StoreError> {
+    proof_mac(proof, secret)
+}
+
+/// Constant-time string comparison for MAC tags — avoids leaking how many
+/// leading characters matched via timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+impl Store {
+    /// Install a policy-level freeze over a grant class (incident mode). The
+    /// freeze is a positive, signed, receipt-bearing artifact (L6) — NOT the
+    /// absence of a grant. It does not touch any grant record; matching requests
+    /// are refused with `class_frozen` while the freeze is active. See
+    /// docs/lifecycle-freeze.md.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_freeze(
+        &mut self,
+        handle: &str,
+        class_type: &str,
+        class_value: &str,
+        audience_scope: Option<&str>,
+        reason: &str,
+        frozen_until: Option<DateTime<Utc>>,
+        operator: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Receipt, StoreError> {
+        if self.get_freeze(handle)?.is_some() {
+            return Err(StoreError::FreezeExists(handle.to_string()));
+        }
+        let receipt = ReceiptBuilder::new(ReceiptKind::PolicyFrozen, operator, handle)
+            .evidence(serde_json::json!({
+                "handle": handle,
+                "class_type": class_type,
+                "class_value": class_value,
+                "audience_scope": audience_scope,
+                "reason": reason,
+                "frozen_at": now.to_rfc3339(),
+                "frozen_until": frozen_until.map(|t| t.to_rfc3339()),
+            }))
+            .build()?;
+        let tx = self.conn.transaction()?;
+        insert_receipt(&tx, &receipt)?;
+        tx.execute(
+            "INSERT INTO policy_freezes
+                (handle, class_type, class_value, audience_scope, reason, frozen_at, frozen_until, freeze_receipt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                handle, class_type, class_value, audience_scope, reason,
+                now.to_rfc3339(), frozen_until.map(|t| t.to_rfc3339()), receipt.digest,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    /// Lift a freeze (explicit thaw). Receipt-bearing; the same grant class is
+    /// authorizable again with no re-issue.
+    pub fn thaw_freeze(&mut self, handle: &str, operator: &str, now: DateTime<Utc>) -> Result<Receipt, StoreError> {
+        let f = self.get_freeze(handle)?.ok_or_else(|| StoreError::FreezeNotFound(handle.to_string()))?;
+        if f.thawed_at.is_some() {
+            return Err(StoreError::FreezeNotFound(format!("{handle} (already thawed)")));
+        }
+        let receipt = ReceiptBuilder::new(ReceiptKind::PolicyThawed, operator, handle)
+            .parent_digest(f.freeze_receipt.clone())
+            .evidence(serde_json::json!({ "handle": handle, "thawed_at": now.to_rfc3339() }))
+            .build()?;
+        let tx = self.conn.transaction()?;
+        insert_receipt(&tx, &receipt)?;
+        tx.execute(
+            "UPDATE policy_freezes SET thawed_at = ?1, thaw_receipt = ?2 WHERE handle = ?3",
+            params![now.to_rfc3339(), receipt.digest, handle],
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    /// Fetch a freeze by handle.
+    pub fn get_freeze(&self, handle: &str) -> Result<Option<FreezeRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT handle, class_type, class_value, audience_scope, reason, frozen_at, frozen_until, thawed_at, freeze_receipt
+             FROM policy_freezes WHERE handle = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![handle], map_freeze_row)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List freezes. `active_only` excludes explicitly-thawed ones (but includes
+    /// lazily-expired `frozen_until` freezes — the caller filters those against
+    /// `now` if it cares).
+    pub fn list_freezes(&self, active_only: bool) -> Result<Vec<FreezeRow>, StoreError> {
+        let sql = if active_only {
+            "SELECT handle, class_type, class_value, audience_scope, reason, frozen_at, frozen_until, thawed_at, freeze_receipt
+             FROM policy_freezes WHERE thawed_at IS NULL ORDER BY frozen_at DESC"
+        } else {
+            "SELECT handle, class_type, class_value, audience_scope, reason, frozen_at, frozen_until, thawed_at, freeze_receipt
+             FROM policy_freezes ORDER BY frozen_at DESC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], map_freeze_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// The active freeze covering this request, if any. Honors lazy
+    /// `frozen_until` expiry (a past `until` no longer matches — deny-overlay
+    /// predicate, not a scheduler) and audience scoping (a freeze scoped to
+    /// audience B does not screen B', L6).
+    pub fn active_freeze_for(
+        &self,
+        claim_kind: &str,
+        actor: &str,
+        audience: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<FreezeRow>, StoreError> {
+        find_active_freeze(&self.conn, now, |f| {
+            if let Some(scope) = &f.audience_scope {
+                if scope != audience {
+                    return false; // scoped to a different audience (L6)
+                }
+            }
+            match f.class_type.as_str() {
+                "claim_kind" => f.class_value == claim_kind,
+                "actor" => f.class_value == actor,
+                "audience" => f.class_value == audience,
+                _ => false,
+            }
+        })
+    }
+}
+
+/// Find the first active (non-thawed, non-lazily-expired) freeze matching
+/// `matcher`. Takes a bare `&Connection` so it works both on the store and
+/// inside an open transaction (`&Transaction` derefs to `&Connection`).
+fn find_active_freeze(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    matcher: impl Fn(&FreezeRow) -> bool,
+) -> Result<Option<FreezeRow>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT handle, class_type, class_value, audience_scope, reason, frozen_at, frozen_until, thawed_at, freeze_receipt
+         FROM policy_freezes WHERE thawed_at IS NULL ORDER BY frozen_at DESC",
+    )?;
+    let rows = stmt.query_map([], map_freeze_row)?;
+    for r in rows {
+        let f = r?;
+        if let Some(until) = &f.frozen_until {
+            if let Ok(u) = DateTime::parse_from_rfc3339(until) {
+                if now >= u.to_utc() {
+                    continue; // lazily expired
+                }
+            }
+        }
+        if matcher(&f) {
+            return Ok(Some(f));
+        }
+    }
+    Ok(None)
+}
+
+/// A policy freeze as returned from the store.
+#[derive(Debug, Clone)]
+pub struct FreezeRow {
+    pub handle: String,
+    pub class_type: String,
+    pub class_value: String,
+    pub audience_scope: Option<String>,
+    pub reason: String,
+    pub frozen_at: String,
+    pub frozen_until: Option<String>,
+    pub thawed_at: Option<String>,
+    pub freeze_receipt: String,
+}
+
+fn map_freeze_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FreezeRow> {
+    Ok(FreezeRow {
+        handle: row.get(0)?,
+        class_type: row.get(1)?,
+        class_value: row.get(2)?,
+        audience_scope: row.get(3)?,
+        reason: row.get(4)?,
+        frozen_at: row.get(5)?,
+        frozen_until: row.get(6)?,
+        thawed_at: row.get(7)?,
+        freeze_receipt: row.get(8)?,
+    })
+}
+
 fn map_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
         id: row.get(0)?,
@@ -606,6 +1414,169 @@ fn insert_receipt(tx: &Transaction, receipt: &Receipt) -> Result<(), StoreError>
     Ok(())
 }
 
+// -- assertion-lease helpers (Phase 4b) ---------------------------------
+
+fn read_assertion_snapshot(tx: &Transaction, grant_id: &str) -> Result<AssertionSnapshot, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT state, latest_receipt_digest, actor, claim_kind, subject_scope, audience,
+                not_before, issued_at, expires_at, max_uses, spend_count
+         FROM assertion_grants WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![grant_id], |row| {
+        Ok(AssertionSnapshot {
+            state: row.get(0)?,
+            head_digest: row.get(1)?,
+            actor: row.get(2)?,
+            claim_kind: row.get(3)?,
+            subject_scope: row.get(4)?,
+            audience: row.get(5)?,
+            not_before: row.get(6)?,
+            issued_at: row.get(7)?,
+            expires_at: row.get(8)?,
+            max_uses: row.get(9)?,
+            spend_count: row.get(10)?,
+        })
+    })?;
+    match rows.next() {
+        Some(r) => Ok(r?),
+        None => Err(StoreError::AssertionGrantNotFound(grant_id.to_string())),
+    }
+}
+
+/// Rebuild an [`AssertionGrant`] from a stored snapshot so the shared window /
+/// coverage / budget predicates can run. Fail-closed (L2): an unparseable or
+/// missing `not_before`/`expires_at` is refused as `AssertionWindowIncoherent`,
+/// never silently skipped.
+fn snapshot_to_grant(snap: &AssertionSnapshot, grant_id: &str) -> Result<AssertionGrant, StoreError> {
+    let parse = |o: &Option<String>| -> Result<DateTime<Utc>, StoreError> {
+        o.as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.to_utc())
+            .ok_or(StoreError::AssertionWindowIncoherent)
+    };
+    let not_before = parse(&snap.not_before)?;
+    let expires_at = parse(&snap.expires_at)?;
+    let issued_at = parse(&snap.issued_at).unwrap_or(not_before);
+    let id = Uuid::parse_str(grant_id).unwrap_or_else(|_| Uuid::nil());
+    Ok(AssertionGrant {
+        id,
+        actor: Principal::new(snap.actor.clone(), snap.actor.clone()),
+        scope: AssertionScope {
+            claim_kind: snap.claim_kind.clone(),
+            subject_scope: snap.subject_scope.clone(),
+            audience: snap.audience.clone(),
+        },
+        not_before,
+        issued_at,
+        expires_at,
+        max_uses: snap.max_uses.map(|m| m.max(0) as u64),
+        spend_count: snap.spend_count.max(0) as u64,
+    })
+}
+
+fn build_assertion_receipt(
+    kind: ReceiptKind,
+    actor: &str,
+    subject: &str,
+    parent_digest: &str,
+    evidence: serde_json::Value,
+    policy_hash: Option<&str>,
+) -> Result<Receipt, StoreError> {
+    let mut b = ReceiptBuilder::new(kind, actor, subject)
+        .parent_digest(parent_digest)
+        .evidence(evidence);
+    if let Some(ph) = policy_hash {
+        b = b.policy_hash(ph);
+    }
+    Ok(b.build()?)
+}
+
+fn find_issuance_digest(tx: &Transaction, grant_id: &str) -> Result<Option<String>, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT digest FROM receipts WHERE subject = ?1 AND kind = 'assertion_grant_issued'
+         ORDER BY created_at ASC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![grant_id], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+fn map_assertion_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssertionGrantRow> {
+    Ok(AssertionGrantRow {
+        id: row.get(0)?,
+        actor: row.get(1)?,
+        claim_kind: row.get(2)?,
+        subject_scope: row.get(3)?,
+        audience: row.get(4)?,
+        state: row.get(5)?,
+        not_before: row.get(6)?,
+        issued_at: row.get(7)?,
+        expires_at: row.get(8)?,
+        max_uses: row.get::<_, Option<i64>>(9)?.map(|m| m.max(0) as u64),
+        spend_count: row.get::<_, i64>(10)?.max(0) as u64,
+        latest_receipt_digest: row.get(11)?,
+    })
+}
+
+/// Metadata for creating/updating an assertion-lease row.
+pub struct AssertionGrantMeta {
+    pub actor: String,
+    pub claim_kind: String,
+    pub subject_scope: String,
+    pub audience: String,
+    pub not_before: Option<DateTime<Utc>>,
+    pub issued_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub max_uses: Option<u64>,
+}
+
+/// An assertion lease as returned from the store.
+#[derive(Debug)]
+pub struct AssertionGrantRow {
+    pub id: String,
+    pub actor: String,
+    pub claim_kind: String,
+    pub subject_scope: String,
+    pub audience: String,
+    pub state: String,
+    pub not_before: Option<String>,
+    pub issued_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub max_uses: Option<u64>,
+    pub spend_count: u64,
+    pub latest_receipt_digest: String,
+}
+
+/// Internal: snapshot of an assertion lease read inside a transaction.
+struct AssertionSnapshot {
+    state: String,
+    head_digest: String,
+    actor: String,
+    claim_kind: String,
+    subject_scope: String,
+    audience: String,
+    not_before: Option<String>,
+    issued_at: Option<String>,
+    expires_at: Option<String>,
+    max_uses: Option<i64>,
+    spend_count: i64,
+}
+
+/// Result of a successful assertion spend.
+#[derive(Debug)]
+pub struct AssertionSpendResult {
+    /// Digest of the `AssertionMade` receipt.
+    pub receipt_digest: String,
+    /// 1-based sequence number of this spend.
+    pub spend_seq: u64,
+    /// True if this spend hit the use budget and drove the lease to `Exhausted`.
+    pub exhausted: bool,
+    /// The `AssertionMade` receipt.
+    pub receipt: Receipt,
+}
+
 /// Metadata for creating/updating a grant row.
 pub struct GrantMeta {
     /// Stable principal ID the grant is bound to
@@ -616,6 +1587,7 @@ pub struct GrantMeta {
     pub target: String,
     pub issued_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
+    pub not_before: Option<DateTime<Utc>>,
 }
 
 /// A receipt as returned from the store.
@@ -654,6 +1626,7 @@ struct GrantSnapshot {
     expires_at: Option<String>,
     action: String,
     target: String,
+    not_before: Option<String>,
 }
 
 /// Result of a successful transition.
@@ -694,6 +1667,7 @@ mod tests {
             target: "prod".to_string(),
             issued_at: None,
             expires_at: None,
+            not_before: None,
         }
     }
 
@@ -705,6 +1679,7 @@ mod tests {
             target: "prod".to_string(),
             issued_at: Some(Utc::now()),
             expires_at: Some(expires_at),
+            not_before: None,
         }
     }
 
@@ -931,7 +1906,8 @@ mod tests {
 
     #[test]
     fn expired_grant_cannot_be_activated() {
-        let past = Utc::now() - Duration::seconds(10);
+        // Well beyond the 30s expiry-skew grace.
+        let past = Utc::now() - Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(past);
 
         let err = store.transition(
@@ -943,7 +1919,7 @@ mod tests {
 
     #[test]
     fn expired_grant_cannot_be_used() {
-        let past = Utc::now() - Duration::seconds(10);
+        let past = Utc::now() - Duration::seconds(300);
         let (mut store, id) = setup_active_grant(past);
 
         let err = store.transition(
@@ -951,6 +1927,71 @@ mod tests {
             &bot_subject(), serde_json::json!({"action": "deploy"}), None,
         ).unwrap_err();
         assert!(matches!(err, StoreError::GrantExpired(_)));
+    }
+
+    #[test]
+    fn grant_expired_within_skew_grace_is_still_usable() {
+        // Expired 5s ago — inside the 30s skew grace, so a slightly-fast
+        // verifier clock does not hard-fail a just-expired grant.
+        let just_past = Utc::now() - Duration::seconds(5);
+        let (mut store, id) = setup_active_grant(just_past);
+
+        let r = store.transition(
+            &id, GrantState::Used, ReceiptKind::GrantUsed,
+            &bot_subject(), serde_json::json!({"action": "deploy"}), None,
+        );
+        assert!(r.is_ok(), "grant within skew grace should still be usable");
+    }
+
+    #[test]
+    fn act_grant_not_before_refused_then_allowed() {
+        let mut store = Store::in_memory().unwrap();
+        let grant_id = Uuid::new_v4();
+        let id_str = grant_id.to_string();
+        let future = Utc::now() + Duration::seconds(300);
+        let far = Utc::now() + Duration::seconds(3600);
+
+        let r1 = ReceiptBuilder::new(ReceiptKind::GrantRequested, SUBJECT_ID, &id_str).build().unwrap();
+        store.record_transition(grant_id, &GrantState::Requested, &r1, Some(meta())).unwrap();
+        let r2 = ReceiptBuilder::new(ReceiptKind::GrantIssued, SUBJECT_ID, &id_str)
+            .parent_digest(&r1.digest).build().unwrap();
+        // Issued with not_before in the future.
+        store.record_transition(grant_id, &GrantState::Issued, &r2, Some(GrantMeta {
+            subject_id: SUBJECT_ID.to_string(), actor: "deploy-bot".to_string(),
+            action: "deploy".to_string(), target: "prod".to_string(),
+            issued_at: Some(Utc::now()), expires_at: Some(far), not_before: Some(future),
+        })).unwrap();
+
+        // Activation before not_before is refused.
+        let err = store.transition(
+            &id_str, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
+        ).unwrap_err();
+        assert!(matches!(err, StoreError::GrantNotYetValid(_)));
+    }
+
+    #[test]
+    fn act_grant_freeze_blocks_activation_and_thaw_restores() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        // Freeze the "deploy" action class (setup grants use action=deploy).
+        store.install_freeze(
+            "inc-act", "action", "deploy", None, "deploy paused", None, "admin:jbeck", Utc::now(),
+        ).unwrap();
+
+        let err = store.transition(
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
+        ).unwrap_err();
+        assert!(matches!(err, StoreError::ClassFrozen { .. }));
+
+        // Thaw restores — the same grant activates, no re-issue.
+        store.thaw_freeze("inc-act", "admin:jbeck", Utc::now()).unwrap();
+        assert!(store.transition(
+            &id, GrantState::Active, ReceiptKind::GrantActivated,
+            &bot_subject(), serde_json::Value::Null, None,
+        ).is_ok());
     }
 
     #[test]
@@ -1267,5 +2308,345 @@ mod tests {
             r1.policy_hash, r2.policy_hash,
             "same policy source produces same hash across instances"
         );
+    }
+}
+
+#[cfg(test)]
+mod assertion_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use standing_grant::AssertionGrantState;
+    use standing_receipt::{ReceiptBuilder, ReceiptKind};
+
+    const ACTOR: &str = "component:nq:linode";
+
+    fn meta(not_before: DateTime<Utc>, expires_at: Option<DateTime<Utc>>, max_uses: Option<u64>) -> AssertionGrantMeta {
+        AssertionGrantMeta {
+            actor: ACTOR.into(),
+            claim_kind: "sqlite_wal_state".into(),
+            subject_scope: "labelwatch/*".into(),
+            audience: "nq:main".into(),
+            not_before: Some(not_before),
+            issued_at: Some(not_before),
+            expires_at,
+            max_uses,
+        }
+    }
+
+    /// Create an Issued lease with a valid 2-receipt chain (Requested → Issued).
+    fn issued_lease(
+        store: &mut Store,
+        not_before: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+        max_uses: Option<u64>,
+    ) -> Uuid {
+        let grant_id = Uuid::new_v4();
+        let subject = grant_id.to_string();
+        let r1 = ReceiptBuilder::new(ReceiptKind::AssertionGrantRequested, ACTOR, &subject)
+            .evidence(serde_json::json!({ "scope": "labelwatch/*" }))
+            .build()
+            .unwrap();
+        store
+            .record_assertion_transition(grant_id, &AssertionGrantState::Requested, &r1, Some(meta(not_before, None, max_uses)))
+            .unwrap();
+        let r2 = ReceiptBuilder::new(ReceiptKind::AssertionGrantIssued, ACTOR, &subject)
+            .parent_digest(r1.digest.clone())
+            .evidence(serde_json::json!({ "terms": "full" }))
+            .build()
+            .unwrap();
+        store
+            .record_assertion_transition(grant_id, &AssertionGrantState::Issued, &r2, Some(meta(not_before, expires_at, max_uses)))
+            .unwrap();
+        grant_id
+    }
+
+    fn proof(grant_id: Uuid, jti: &str, subject_id: &str) -> RequestProof {
+        RequestProof {
+            grant_id,
+            actor: ACTOR.into(),
+            claim_kind: "sqlite_wal_state".into(),
+            subject_id: subject_id.into(),
+            audience: "nq:main".into(),
+            jti: jti.into(),
+            body_digest: Some("deadbeef".into()),
+            issued_at: Utc::now(),
+        }
+    }
+
+    fn wide() -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+        (Utc::now() - Duration::days(1), Some(Utc::now() + Duration::days(365)))
+    }
+
+    #[test]
+    fn happy_spend_reuses_lease() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+
+        let r1 = store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+        assert_eq!(r1.spend_seq, 1);
+        assert!(!r1.exhausted);
+        let r2 = store.spend_assertion(&proof(gid, "jti-1", "labelwatch/bar"), Utc::now()).unwrap();
+        assert_eq!(r2.spend_seq, 2);
+
+        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        assert_eq!(g.state, "active");
+        assert_eq!(g.spend_count, 2);
+    }
+
+    #[test]
+    fn first_spend_auto_activates_with_receipt() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+        store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+
+        let kinds: Vec<String> = store
+            .receipt_chain(&gid.to_string())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        // Requested, Issued, Activated (auto), AssertionMade — the chain never
+        // shows a spend without a prior activation (amendment #3).
+        assert_eq!(
+            kinds,
+            vec![
+                "assertion_grant_requested",
+                "assertion_grant_issued",
+                "assertion_grant_activated",
+                "assertion_made",
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_mismatch_does_not_consume() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, Some(5));
+
+        // Out-of-scope subject refuses...
+        let err = store.spend_assertion(&proof(gid, "jti-x", "other/foo"), Utc::now());
+        assert!(matches!(err, Err(StoreError::AssertionOutOfScope { .. })));
+
+        // ...and did not burn the budget OR the jti: the SAME jti now spends.
+        store.spend_assertion(&proof(gid, "jti-x", "labelwatch/foo"), Utc::now()).unwrap();
+        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        assert_eq!(g.spend_count, 1, "refused spend must be non-consuming");
+    }
+
+    #[test]
+    fn replay_is_refused() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+
+        store.spend_assertion(&proof(gid, "jti-dup", "labelwatch/foo"), Utc::now()).unwrap();
+        let replay = store.spend_assertion(&proof(gid, "jti-dup", "labelwatch/foo"), Utc::now());
+        assert!(matches!(replay, Err(StoreError::ReplayDetected { .. })));
+
+        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        assert_eq!(g.spend_count, 1, "replay must not consume");
+    }
+
+    #[test]
+    fn expired_window_refused() {
+        let mut store = Store::in_memory().unwrap();
+        let nb = Utc::now() - Duration::days(10);
+        let exp = Some(Utc::now() - Duration::days(1));
+        let gid = issued_lease(&mut store, nb, exp, None);
+        let err = store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now());
+        assert!(matches!(err, Err(StoreError::AssertionWindowClosed(_))));
+    }
+
+    #[test]
+    fn not_yet_valid_refused() {
+        let mut store = Store::in_memory().unwrap();
+        let nb = Utc::now() + Duration::days(1);
+        let exp = Some(Utc::now() + Duration::days(2));
+        let gid = issued_lease(&mut store, nb, exp, None);
+        let err = store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now());
+        assert!(matches!(err, Err(StoreError::AssertionNotYetValid(_))));
+    }
+
+    #[test]
+    fn missing_expiry_fails_closed() {
+        // A lease whose expires_at was never set: snapshot_to_grant refuses
+        // rather than treating an unknown window as valid (L2).
+        let mut store = Store::in_memory().unwrap();
+        let nb = Utc::now() - Duration::days(1);
+        let gid = issued_lease(&mut store, nb, None, None);
+        let err = store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now());
+        assert!(matches!(err, Err(StoreError::AssertionWindowIncoherent)));
+    }
+
+    #[test]
+    fn budget_exhaustion_drives_terminal() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, Some(2));
+
+        store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+        let second = store.spend_assertion(&proof(gid, "jti-1", "labelwatch/foo"), Utc::now()).unwrap();
+        assert!(second.exhausted, "the k-th spend exhausts");
+
+        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        assert_eq!(g.state, "exhausted");
+
+        // Further spends refuse.
+        let over = store.spend_assertion(&proof(gid, "jti-2", "labelwatch/foo"), Utc::now());
+        assert!(matches!(over, Err(StoreError::AssertionBudgetExhausted { max_uses: 2 })));
+
+        // The exhaustion receipt is in the chain.
+        let kinds: Vec<String> = store
+            .receipt_chain(&gid.to_string())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert!(kinds.contains(&"assertion_grant_exhausted".to_string()));
+    }
+
+    #[test]
+    fn unknown_lease_refused() {
+        let mut store = Store::in_memory().unwrap();
+        let err = store.spend_assertion(&proof(Uuid::new_v4(), "jti-0", "labelwatch/foo"), Utc::now());
+        assert!(matches!(err, Err(StoreError::AssertionGrantNotFound(_))));
+    }
+
+    // -- MAC-verified spend (Phase 5) ------------------------------------
+
+    const KEY: &[u8] = b"audience-key";
+
+    #[test]
+    fn verified_spend_accepts_valid_mac() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+        let p = proof(gid, "jti-mac", "labelwatch/foo");
+        let mac = crate::sign_proof(&p, KEY).unwrap();
+        let r = store.spend_assertion_verified(&p, Some(&mac), KEY, Utc::now()).unwrap();
+        assert_eq!(r.spend_seq, 1);
+    }
+
+    #[test]
+    fn verified_spend_rejects_bad_and_missing_mac() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+        let p = proof(gid, "jti-mac", "labelwatch/foo");
+        // Wrong key → wrong MAC.
+        let bad = crate::sign_proof(&p, b"other-key").unwrap();
+        assert!(matches!(
+            store.spend_assertion_verified(&p, Some(&bad), KEY, Utc::now()),
+            Err(StoreError::AssertionMacInvalid)
+        ));
+        // Missing MAC.
+        assert!(matches!(
+            store.spend_assertion_verified(&p, None, KEY, Utc::now()),
+            Err(StoreError::AssertionMacInvalid)
+        ));
+        // The rejected attempts did not consume the lease.
+        assert_eq!(store.get_assertion_grant(&gid.to_string()).unwrap().unwrap().spend_count, 0);
+    }
+
+    #[test]
+    fn verified_spend_rejects_stale_and_future_proofs() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+
+        // Too old.
+        let mut old = proof(gid, "jti-old", "labelwatch/foo");
+        old.issued_at = Utc::now() - Duration::seconds(3600);
+        let mac = crate::sign_proof(&old, KEY).unwrap();
+        assert!(matches!(
+            store.spend_assertion_verified(&old, Some(&mac), KEY, Utc::now()),
+            Err(StoreError::RequestTimestampOutOfWindow(_))
+        ));
+
+        // Too far in the future (clock disagreement).
+        let mut future = proof(gid, "jti-fut", "labelwatch/foo");
+        future.issued_at = Utc::now() + Duration::seconds(3600);
+        let mac = crate::sign_proof(&future, KEY).unwrap();
+        assert!(matches!(
+            store.spend_assertion_verified(&future, Some(&mac), KEY, Utc::now()),
+            Err(StoreError::ClockSkewExceeded(_))
+        ));
+    }
+
+    // -- policy freeze (Wave 3) ------------------------------------------
+
+    #[test]
+    fn freeze_denies_matching_spend_thaw_restores() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+
+        // Freeze the claim_kind class.
+        store.install_freeze(
+            "incident-1", "claim_kind", "sqlite_wal_state", None,
+            "storage incident", None, "admin:jbeck", Utc::now(),
+        ).unwrap();
+
+        // A covered spend is now refused with class_frozen — non-consuming.
+        let err = store.spend_assertion(&proof(gid, "jf1", "labelwatch/foo"), Utc::now());
+        assert!(matches!(err, Err(StoreError::ClassFrozen { .. })));
+        assert_eq!(store.get_assertion_grant(&gid.to_string()).unwrap().unwrap().spend_count, 0);
+
+        // Thaw restores — the SAME lease spends again, no re-issue.
+        store.thaw_freeze("incident-1", "admin:jbeck", Utc::now()).unwrap();
+        let r = store.spend_assertion(&proof(gid, "jf1", "labelwatch/foo"), Utc::now()).unwrap();
+        assert_eq!(r.spend_seq, 1);
+    }
+
+    #[test]
+    fn freeze_scoped_to_audience_does_not_screen_others() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None); // audience nq:main
+
+        // Freeze claim_kind but scoped to a DIFFERENT audience.
+        store.install_freeze(
+            "incident-2", "claim_kind", "sqlite_wal_state", Some("nq:other"),
+            "other-audience incident", None, "admin:jbeck", Utc::now(),
+        ).unwrap();
+
+        // nq:main is unaffected (L6: scoped freeze doesn't screen B').
+        let r = store.spend_assertion(&proof(gid, "jf2", "labelwatch/foo"), Utc::now());
+        assert!(r.is_ok(), "audience-scoped freeze must not screen a different audience");
+    }
+
+    #[test]
+    fn freeze_until_lazily_expires() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+
+        // Freeze that already expired (until in the past) — no longer screens.
+        store.install_freeze(
+            "incident-3", "claim_kind", "sqlite_wal_state", None,
+            "brief pause", Some(Utc::now() - Duration::seconds(10)), "admin:jbeck", Utc::now(),
+        ).unwrap();
+
+        let r = store.spend_assertion(&proof(gid, "jf3", "labelwatch/foo"), Utc::now());
+        assert!(r.is_ok(), "a past --until freeze should no longer match");
+    }
+
+    #[test]
+    fn revoke_then_spend_refused() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+        store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+
+        let admin = ActorContext::admin(Principal::new("admin:jbeck", "jbeck"));
+        store
+            .transition_assertion(&gid.to_string(), AssertionGrantState::Revoked, ReceiptKind::AssertionGrantRevoked, &admin, serde_json::json!({"reason":"incident"}), None, Utc::now())
+            .unwrap();
+
+        let err = store.spend_assertion(&proof(gid, "jti-1", "labelwatch/foo"), Utc::now());
+        assert!(err.is_err(), "cannot spend a revoked lease");
     }
 }

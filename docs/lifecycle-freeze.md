@@ -1,6 +1,16 @@
 # Lifecycle freeze — incident-mode suspension
 
-> **Status:** `candidate / non-binding`. Names the missing ops-real lifecycle verb between `Active` and `Revoked`. Becomes binding when an incident drill or a consumer-side ops handbook first reaches for the verb.
+> **Status:** `implemented` (Wave 3). `standing policy freeze | thaw |
+> list-freezes` exist; a `policy_freezes` table holds the deny-overlay; freeze
+> and thaw are receipt-bearing (`ReceiptKind::PolicyFrozen` / `PolicyThawed`);
+> matching assertion spends are refused with `standing_basis:
+> class_frozen:<handle>`. `--until` is a lazy deny-overlay predicate (a past
+> `until` simply stops matching — no scheduler, no auto-thaw). Freezes are
+> audience-scopable and a scoped freeze does not screen other audiences. Frozen
+> leases keep counting clock-time toward expiry (deny-overlay, not stop-clock).
+> **Pinned on build:** auth is operator identity (fiat under the genesis chain);
+> freeze applies to the assertion-lease path — act-grant freeze integration is a
+> follow-on.
 >
 > **Composes with:** `docs/remote-standing-boundary.md`, slice-1 grant state machine, README "Invariants" block.
 

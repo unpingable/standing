@@ -16,5 +16,5 @@ mod chain;
 
 pub use canonical::canonical_json;
 pub use error::ReceiptError;
-pub use receipt::{Receipt, ReceiptBuilder, ReceiptKind};
+pub use receipt::{Receipt, ReceiptBuilder, ReceiptKind, SCHEMA_VERSION};
 pub use chain::ReceiptChain;

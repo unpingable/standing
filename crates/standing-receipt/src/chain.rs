@@ -77,9 +77,15 @@ impl ReceiptChain {
         self.receipts.len()
     }
 
-    /// Verify the entire chain's integrity: each receipt's parent_digest
-    /// matches the previous receipt's digest.
+    /// Verify the entire chain's integrity: every receipt re-hashes to its
+    /// stored digest under a known schema version, and each receipt's
+    /// parent_digest matches the previous receipt's digest.
     pub fn verify(&self) -> Result<(), ReceiptError> {
+        // Content-address + schema-version check on every receipt. A chain is
+        // only as trustworthy as the receipts in it re-hash faithfully.
+        for r in &self.receipts {
+            r.verify_integrity()?;
+        }
         for window in self.receipts.windows(2) {
             let prev = &window[0];
             let curr = &window[1];

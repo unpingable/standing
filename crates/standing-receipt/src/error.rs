@@ -13,4 +13,10 @@ pub enum ReceiptError {
 
     #[error("duplicate receipt: {0}")]
     Duplicate(String),
+
+    #[error("unsupported receipt schema_version: {got} (this build supports {supported})")]
+    UnsupportedSchemaVersion { got: u32, supported: u32 },
+
+    #[error("receipt digest mismatch: body hashes to {actual}, but receipt claims {expected}")]
+    DigestMismatch { expected: String, actual: String },
 }
