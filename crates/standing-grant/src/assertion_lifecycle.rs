@@ -14,8 +14,8 @@ use uuid::Uuid;
 use standing_receipt::{Receipt, ReceiptBuilder, ReceiptChain, ReceiptKind};
 
 use crate::assertion::{
-    assertion_covers, AssertCoverage, AssertionGrant, AssertionGrantRequest, AssertionGrantState,
-    AssertionScope, RequestProof, WindowState, ASSERTION_MADE_VERSION,
+    ASSERTION_MADE_VERSION, AssertCoverage, AssertionGrant, AssertionGrantRequest,
+    AssertionGrantState, AssertionScope, RequestProof, WindowState, assertion_covers,
 };
 use crate::error::GrantError;
 use crate::principal::Principal;
@@ -46,19 +46,23 @@ impl AssertionGrantMachine {
         let grant_id = Uuid::new_v4();
         let subject = grant_id.to_string();
 
-        let mut builder = ReceiptBuilder::new(ReceiptKind::AssertionGrantRequested, &req.actor.id, &subject)
-            .evidence(serde_json::json!({
-                "actor": { "id": req.actor.id, "label": req.actor.label },
-                "scope": {
-                    "claim_kind": req.scope.claim_kind,
-                    "subject_scope": req.scope.subject_scope,
-                    "audience": req.scope.audience,
-                },
-                "not_before": req.not_before.to_rfc3339(),
-                "duration_secs": req.duration_secs,
-                "max_uses": req.max_uses,
-                "context": req.context,
-            }));
+        let mut builder = ReceiptBuilder::new(
+            ReceiptKind::AssertionGrantRequested,
+            &req.actor.id,
+            &subject,
+        )
+        .evidence(serde_json::json!({
+            "actor": { "id": req.actor.id, "label": req.actor.label },
+            "scope": {
+                "claim_kind": req.scope.claim_kind,
+                "subject_scope": req.scope.subject_scope,
+                "audience": req.scope.audience,
+            },
+            "not_before": req.not_before.to_rfc3339(),
+            "duration_secs": req.duration_secs,
+            "max_uses": req.max_uses,
+            "context": req.context,
+        }));
         if let Some(g) = genesis_digest {
             builder = builder.parent_digest(g);
         }
@@ -81,6 +85,7 @@ impl AssertionGrantMachine {
     /// evidence binds the FULL terms so scope cannot be widened later (L3/L4).
     pub fn issue(
         &mut self,
+        issuer: &Principal,
         genesis_digest: &str,
         policy_hash: &str,
         evidence: serde_json::Value,
@@ -88,6 +93,9 @@ impl AssertionGrantMachine {
         self.require_state(&AssertionGrantState::Requested)?;
         if genesis_digest.is_empty() {
             return Err(GrantError::NoGenesis);
+        }
+        if issuer.id == self.actor_id() {
+            return Err(GrantError::AssertionSelfGrant(issuer.id.clone()));
         }
 
         let req = self.request_from_chain();
@@ -107,7 +115,7 @@ impl AssertionGrantMachine {
 
         let receipt = ReceiptBuilder::new(
             ReceiptKind::AssertionGrantIssued,
-            &grant.actor.id,
+            &issuer.id,
             self.grant_id.to_string(),
         )
         .parent_digest(self.chain.tip().digest.clone())
@@ -124,6 +132,7 @@ impl AssertionGrantMachine {
                 "max_uses": grant.max_uses,
             },
             "settlement_witness": genesis_digest,  // prior witness (L4)
+            "operator_id": issuer.id,
             "detail": evidence,
         }))
         .build()
@@ -136,7 +145,11 @@ impl AssertionGrantMachine {
     }
 
     /// Deny the lease (policy rejected). Transitions Requested → Denied.
-    pub fn deny(&mut self, policy_hash: &str, evidence: serde_json::Value) -> Result<&Receipt, GrantError> {
+    pub fn deny(
+        &mut self,
+        policy_hash: &str,
+        evidence: serde_json::Value,
+    ) -> Result<&Receipt, GrantError> {
         self.require_state(&AssertionGrantState::Requested)?;
         let receipt = ReceiptBuilder::new(
             ReceiptKind::AssertionGrantDenied,
@@ -180,7 +193,11 @@ impl AssertionGrantMachine {
     ///
     /// Replay defense is NOT here — the single-use `jti` ledger needs the store.
     /// The store's `spend_assertion` runs this same check set plus replay + CAS.
-    pub fn spend(&mut self, proof: &RequestProof, now: DateTime<Utc>) -> Result<&Receipt, GrantError> {
+    pub fn spend(
+        &mut self,
+        proof: &RequestProof,
+        now: DateTime<Utc>,
+    ) -> Result<&Receipt, GrantError> {
         self.require_state(&AssertionGrantState::Active)?;
         let grant = self
             .grant
@@ -190,18 +207,31 @@ impl AssertionGrantMachine {
 
         // Coverage (names the failing axis for the basis).
         if proof.actor != grant.actor.id {
-            return Err(GrantError::OutOfScope { axis: "actor_mismatch".into() });
+            return Err(GrantError::OutOfScope {
+                axis: "actor_mismatch".into(),
+            });
         }
-        match assertion_covers(&grant.scope, &proof.claim_kind, &proof.subject_id, &proof.audience) {
+        match assertion_covers(
+            &grant.scope,
+            &proof.claim_kind,
+            &proof.subject_id,
+            &proof.audience,
+        ) {
             AssertCoverage::Covered => {}
             AssertCoverage::ClaimKindMismatch => {
-                return Err(GrantError::OutOfScope { axis: "claim_kind_out_of_scope".into() });
+                return Err(GrantError::OutOfScope {
+                    axis: "claim_kind_out_of_scope".into(),
+                });
             }
             AssertCoverage::SubjectMismatch => {
-                return Err(GrantError::OutOfScope { axis: "subject_out_of_scope".into() });
+                return Err(GrantError::OutOfScope {
+                    axis: "subject_out_of_scope".into(),
+                });
             }
             AssertCoverage::AudienceMismatch => {
-                return Err(GrantError::OutOfScope { axis: "audience_mismatch".into() });
+                return Err(GrantError::OutOfScope {
+                    axis: "audience_mismatch".into(),
+                });
             }
         }
 
@@ -244,15 +274,21 @@ impl AssertionGrantMachine {
     /// Revoke the lease. Transitions Issued|Active → Revoked.
     pub fn revoke(&mut self, reason: &str) -> Result<&Receipt, GrantError> {
         self.require_non_terminal_lease()?;
-        self.emit_terminal(AssertionGrantState::Revoked, ReceiptKind::AssertionGrantRevoked,
-            serde_json::json!({ "reason": reason }))
+        self.emit_terminal(
+            AssertionGrantState::Revoked,
+            ReceiptKind::AssertionGrantRevoked,
+            serde_json::json!({ "reason": reason }),
+        )
     }
 
     /// Expire the lease. Transitions Issued|Active → Expired.
     pub fn expire(&mut self) -> Result<&Receipt, GrantError> {
         self.require_non_terminal_lease()?;
-        self.emit_terminal(AssertionGrantState::Expired, ReceiptKind::AssertionGrantExpired,
-            serde_json::Value::Null)
+        self.emit_terminal(
+            AssertionGrantState::Expired,
+            ReceiptKind::AssertionGrantExpired,
+            serde_json::Value::Null,
+        )
     }
 
     /// Mark the lease exhausted (use budget hit). Transitions Active → Exhausted.
@@ -264,8 +300,11 @@ impl AssertionGrantMachine {
             });
         }
         let max_uses = self.grant.as_ref().and_then(|g| g.max_uses).unwrap_or(0);
-        self.emit_terminal(AssertionGrantState::Exhausted, ReceiptKind::AssertionGrantExhausted,
-            serde_json::json!({ "max_uses": max_uses }))
+        self.emit_terminal(
+            AssertionGrantState::Exhausted,
+            ReceiptKind::AssertionGrantExhausted,
+            serde_json::json!({ "max_uses": max_uses }),
+        )
     }
 
     pub fn grant_id(&self) -> Uuid {
@@ -324,12 +363,18 @@ impl AssertionGrantMachine {
     fn request_from_chain(&self) -> AssertionGrantRequest {
         let e = &self.chain.receipts()[0].evidence;
         let actor = Principal {
-            id: e["actor"]["id"].as_str().unwrap_or(self.actor_id()).to_string(),
+            id: e["actor"]["id"]
+                .as_str()
+                .unwrap_or(self.actor_id())
+                .to_string(),
             label: e["actor"]["label"].as_str().unwrap_or("").to_string(),
         };
         let scope = AssertionScope {
             claim_kind: e["scope"]["claim_kind"].as_str().unwrap_or("").to_string(),
-            subject_scope: e["scope"]["subject_scope"].as_str().unwrap_or("").to_string(),
+            subject_scope: e["scope"]["subject_scope"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
             audience: e["scope"]["audience"].as_str().unwrap_or("").to_string(),
         };
         let not_before = e["not_before"]
@@ -411,19 +456,36 @@ mod tests {
         }
     }
 
+    fn operator() -> Principal {
+        Principal::new("wl:operator:laptop", "operator")
+    }
+
     #[test]
     fn happy_path_lease_with_reuse() {
         let mut m = AssertionGrantMachine::request(&req(Some(3))).unwrap();
         assert_eq!(m.state, AssertionGrantState::Requested);
-        m.issue("genesis-digest", "policy-hash", serde_json::json!({"ok": true})).unwrap();
+        m.issue(
+            &operator(),
+            "genesis-digest",
+            "policy-hash",
+            serde_json::json!({"ok": true}),
+        )
+        .unwrap();
         assert_eq!(m.state, AssertionGrantState::Issued);
+        let issued = m.chain.tip();
+        assert_eq!(issued.actor, "wl:operator:laptop");
+        assert_eq!(issued.evidence["operator_id"], "wl:operator:laptop");
         m.activate(Utc::now()).unwrap();
         assert_eq!(m.state, AssertionGrantState::Active);
 
         // Spend three times — the lease stays Active (reuse).
         let gid = m.grant_id();
         for i in 0..3 {
-            m.spend(&proof(gid, &format!("jti-{i}"), "labelwatch/foo"), Utc::now()).unwrap();
+            m.spend(
+                &proof(gid, &format!("jti-{i}"), "labelwatch/foo"),
+                Utc::now(),
+            )
+            .unwrap();
             assert_eq!(m.state, AssertionGrantState::Active);
         }
         assert_eq!(m.grant.as_ref().unwrap().spend_count, 3);
@@ -433,16 +495,33 @@ mod tests {
     #[test]
     fn issue_without_genesis_fails_closed() {
         let mut m = AssertionGrantMachine::request(&req(None)).unwrap();
-        assert!(matches!(m.issue("", "p", serde_json::json!(null)), Err(GrantError::NoGenesis)));
+        assert!(matches!(
+            m.issue(&operator(), "", "p", serde_json::json!(null)),
+            Err(GrantError::NoGenesis)
+        ));
+    }
+
+    #[test]
+    fn speaker_cannot_issue_its_own_lease() {
+        let mut m = AssertionGrantMachine::request(&req(None)).unwrap();
+        let speaker = Principal::new("component:nq:linode", "nq@linode");
+        assert!(matches!(
+            m.issue(&speaker, "g", "p", serde_json::json!(null)),
+            Err(GrantError::AssertionSelfGrant(_))
+        ));
+        assert_eq!(m.state, AssertionGrantState::Requested);
+        assert_eq!(m.chain.len(), 1, "refused self-grant must emit no receipt");
     }
 
     #[test]
     fn budget_exhaustion_refuses_then_exhausts() {
         let mut m = AssertionGrantMachine::request(&req(Some(1))).unwrap();
-        m.issue("g", "p", serde_json::json!(null)).unwrap();
+        m.issue(&operator(), "g", "p", serde_json::json!(null))
+            .unwrap();
         m.activate(Utc::now()).unwrap();
         let gid = m.grant_id();
-        m.spend(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+        m.spend(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now())
+            .unwrap();
         // Budget of 1 is now spent — next spend refuses.
         assert!(matches!(
             m.spend(&proof(gid, "jti-1", "labelwatch/foo"), Utc::now()),
@@ -456,7 +535,8 @@ mod tests {
     #[test]
     fn out_of_scope_subject_refused() {
         let mut m = AssertionGrantMachine::request(&req(None)).unwrap();
-        m.issue("g", "p", serde_json::json!(null)).unwrap();
+        m.issue(&operator(), "g", "p", serde_json::json!(null))
+            .unwrap();
         m.activate(Utc::now()).unwrap();
         let gid = m.grant_id();
         assert!(matches!(
@@ -468,20 +548,28 @@ mod tests {
     #[test]
     fn cannot_spend_before_active() {
         let mut m = AssertionGrantMachine::request(&req(None)).unwrap();
-        m.issue("g", "p", serde_json::json!(null)).unwrap();
+        m.issue(&operator(), "g", "p", serde_json::json!(null))
+            .unwrap();
         let gid = m.grant_id();
-        assert!(m.spend(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).is_err());
+        assert!(
+            m.spend(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now())
+                .is_err()
+        );
     }
 
     #[test]
     fn revoke_is_terminal() {
         let mut m = AssertionGrantMachine::request(&req(None)).unwrap();
-        m.issue("g", "p", serde_json::json!(null)).unwrap();
+        m.issue(&operator(), "g", "p", serde_json::json!(null))
+            .unwrap();
         m.activate(Utc::now()).unwrap();
         m.revoke("incident").unwrap();
         assert_eq!(m.state, AssertionGrantState::Revoked);
         let gid = m.grant_id();
-        assert!(m.spend(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).is_err());
+        assert!(
+            m.spend(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now())
+                .is_err()
+        );
     }
 
     #[test]
@@ -490,7 +578,11 @@ mod tests {
         r.not_before = t("2099-01-01T00:00:00Z");
         r.duration_secs = 3600;
         let mut m = AssertionGrantMachine::request(&r).unwrap();
-        m.issue("g", "p", serde_json::json!(null)).unwrap();
-        assert!(matches!(m.activate(Utc::now()), Err(GrantError::NotYetValid { .. })));
+        m.issue(&operator(), "g", "p", serde_json::json!(null))
+            .unwrap();
+        assert!(matches!(
+            m.activate(Utc::now()),
+            Err(GrantError::NotYetValid { .. })
+        ));
     }
 }

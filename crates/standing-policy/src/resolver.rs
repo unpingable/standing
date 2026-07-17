@@ -9,12 +9,11 @@
 //! entitlement-to-act (`standing-grant::Grant`). The two primitives share
 //! the receipt kernel and canonical-JSON discipline; they differ in scope
 //! shape (action × target vs claim_kind × subject_scope × audience) and
-//! lifecycle (single-use action vs lease over many assertions — the latter
-//! arrives post-MVP).
+//! lifecycle (single-use action vs lease over many assertions).
 //!
-//! MVP ships the trait + `DenyAllResolver` + `LocalOnlyResolver`. The
-//! `StaticConfigResolver` ships alongside in `crate::config`. `StoreResolver`
-//! is post-MVP — it arrives with the `AssertionGrant` lifecycle.
+//! The original MVP shipped the trait, `DenyAllResolver`, `LocalOnlyResolver`,
+//! and `StaticConfigResolver`. The lease-backed `StoreResolver` now lives in
+//! `standing-store`, alongside the authoritative assertion-grant state.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -122,6 +121,31 @@ pub struct StandingDecision {
     /// Refusal-mode-shaped string. One of the constants in `basis::*`,
     /// or `"allowed_by_<resolver>"` for the success path.
     pub standing_basis: String,
+    /// Exact request coordinates retained so a recorded decision cannot be
+    /// detached from the claim it assessed.
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub claim_kind: String,
+    #[serde(default)]
+    pub subject_scope: String,
+    /// Per-request proof bindings echoed from the request. Lease-backed
+    /// binding resolution requires these before authorizing; other resolvers
+    /// preserve them when supplied.
+    #[serde(default)]
+    pub jti: Option<String>,
+    #[serde(default)]
+    pub body_digest: Option<String>,
+    /// Receipt emitted by an authorizing resolver spend, when one occurred.
+    #[serde(default)]
+    pub emitted_receipt_digest: Option<String>,
+    /// Reuse posture for lease-backed decisions. An unbounded kind/scope lease
+    /// is named explicitly and is not certified sound; a finite use-count
+    /// lease has no unbounded reuse marker and is certified sound.
+    #[serde(default)]
+    pub reuse_bound: Option<String>,
+    #[serde(default)]
+    pub certified_sound: Option<bool>,
     /// Matched scope tuples in `claim_kind:subject_scope` form.
     pub scope: Vec<String>,
     pub audience: String,
@@ -137,7 +161,9 @@ pub enum ResolveError {
     #[error("audience must be instance-qualified (<name>:<instance>); got {0:?}")]
     AudienceNotInstanceQualified(String),
 
-    #[error("principal id is not canonical; got {0:?} (expected component:name:instance, human:handle, workload:name:location, or system)")]
+    #[error(
+        "principal id is not canonical; got {0:?} (expected component:name:instance, human:handle, workload:name:location, or system)"
+    )]
     PrincipalNotCanonical(String),
 
     #[error("config parse error: {0}")]
@@ -183,6 +209,9 @@ pub mod basis {
     pub const CLOCK_SKEW_EXCEEDED: &str = "clock_skew_exceeded";
     pub const REQUEST_TIMESTAMP_OUT_OF_WINDOW: &str = "request_timestamp_out_of_window";
     pub const REPLAY_DETECTED: &str = "replay_detected";
+    pub const JTI_REQUIRED: &str = "jti_required";
+    pub const BODY_DIGEST_REQUIRED: &str = "body_digest_required";
+    pub const BODY_DIGEST_INVALID: &str = "body_digest_invalid";
     pub const RECEIPT_MISSING: &str = "receipt_missing";
     pub const DELEGATION_DENIED: &str = "delegation_denied";
     pub const DENY_DEFAULT: &str = "deny_default";
@@ -271,6 +300,14 @@ impl StandingResolver for DenyAllResolver {
             standing_enforced: self.mode.standing_enforced(),
             resolver: "DenyAllResolver".to_string(),
             standing_basis: basis::DENY_DEFAULT.to_string(),
+            actor: request.actor.id.clone(),
+            claim_kind: request.claim_kind.clone(),
+            subject_scope: request.subject_scope.clone(),
+            jti: request.jti.clone(),
+            body_digest: request.body_digest.clone(),
+            emitted_receipt_digest: None,
+            reuse_bound: None,
+            certified_sound: None,
             scope: vec![],
             audience: request.audience.clone(),
             evaluated_at: request.now,
@@ -304,6 +341,14 @@ impl StandingResolver for LocalOnlyResolver {
                 standing_enforced: self.mode.standing_enforced(),
                 resolver: "LocalOnlyResolver".to_string(),
                 standing_basis: "allowed_by_local_only".to_string(),
+                actor: request.actor.id.clone(),
+                claim_kind: request.claim_kind.clone(),
+                subject_scope: request.subject_scope.clone(),
+                jti: request.jti.clone(),
+                body_digest: request.body_digest.clone(),
+                emitted_receipt_digest: None,
+                reuse_bound: None,
+                certified_sound: None,
                 scope: vec![format!("{}:{}", request.claim_kind, request.subject_scope)],
                 audience: request.audience.clone(),
                 evaluated_at: request.now,
@@ -321,6 +366,14 @@ impl StandingResolver for LocalOnlyResolver {
                 standing_enforced: self.mode.standing_enforced(),
                 resolver: "LocalOnlyResolver".to_string(),
                 standing_basis: basis::NON_LOCAL_ACTOR.to_string(),
+                actor: request.actor.id.clone(),
+                claim_kind: request.claim_kind.clone(),
+                subject_scope: request.subject_scope.clone(),
+                jti: request.jti.clone(),
+                body_digest: request.body_digest.clone(),
+                emitted_receipt_digest: None,
+                reuse_bound: None,
+                certified_sound: None,
                 scope: vec![],
                 audience: request.audience.clone(),
                 evaluated_at: request.now,
@@ -346,7 +399,11 @@ impl StaticConfigResolver {
         Self { config, mode }
     }
 
-    fn allowed(&self, request: &StandingRequest, entry_expires_at: Option<DateTime<Utc>>) -> StandingDecision {
+    fn allowed(
+        &self,
+        request: &StandingRequest,
+        entry_expires_at: Option<DateTime<Utc>>,
+    ) -> StandingDecision {
         StandingDecision {
             verdict: StandingVerdict::Allowed,
             reason: "matched static config entry".to_string(),
@@ -355,6 +412,14 @@ impl StaticConfigResolver {
             standing_enforced: self.mode.standing_enforced(),
             resolver: "StaticConfigResolver".to_string(),
             standing_basis: basis::STATIC_CONFIG_MATCH.to_string(),
+            actor: request.actor.id.clone(),
+            claim_kind: request.claim_kind.clone(),
+            subject_scope: request.subject_scope.clone(),
+            jti: request.jti.clone(),
+            body_digest: request.body_digest.clone(),
+            emitted_receipt_digest: None,
+            reuse_bound: None,
+            certified_sound: None,
             scope: vec![format!("{}:{}", request.claim_kind, request.subject_scope)],
             audience: request.audience.clone(),
             evaluated_at: request.now,
@@ -376,6 +441,14 @@ impl StaticConfigResolver {
             standing_enforced: self.mode.standing_enforced(),
             resolver: "StaticConfigResolver".to_string(),
             standing_basis: standing_basis.to_string(),
+            actor: request.actor.id.clone(),
+            claim_kind: request.claim_kind.clone(),
+            subject_scope: request.subject_scope.clone(),
+            jti: request.jti.clone(),
+            body_digest: request.body_digest.clone(),
+            emitted_receipt_digest: None,
+            reuse_bound: None,
+            certified_sound: None,
             scope: vec![],
             audience: request.audience.clone(),
             evaluated_at: request.now,
@@ -544,7 +617,9 @@ mod tests {
     #[test]
     fn decision_records_all_attribution_fields() {
         let resolver = DenyAllResolver::new(ResolverMode::VisibleNotBinding);
-        let request = req(component("nq", "linode"), "nq:main");
+        let request = req(component("nq", "linode"), "nq:main")
+            .with_jti("decision-jti")
+            .with_body_digest("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         let d = resolver.assess(&request).unwrap();
 
         // All attribution fields populated — this is the receipt-discipline
@@ -553,7 +628,43 @@ mod tests {
         assert!(!d.identity_substrate.is_empty());
         assert!(!d.resolver.is_empty());
         assert!(!d.standing_basis.is_empty());
+        assert_eq!(d.actor, "component:nq:linode");
+        assert_eq!(d.claim_kind, "sqlite_wal_state");
+        assert_eq!(d.subject_scope, "labelwatch/foo");
         assert_eq!(d.audience, "nq:main");
+        assert_eq!(d.jti.as_deref(), Some("decision-jti"));
+        assert_eq!(d.body_digest, request.body_digest);
+        assert_eq!(d.emitted_receipt_digest, None);
+        assert_eq!(d.reuse_bound, None);
+        assert_eq!(d.certified_sound, None);
+    }
+
+    #[test]
+    fn decision_new_fields_default_when_deserializing_legacy_shape() {
+        let legacy = serde_json::json!({
+            "verdict": "denied",
+            "reason": "legacy decision",
+            "verification_mode": "deny_all",
+            "identity_substrate": "hmac_workload_id",
+            "standing_enforced": false,
+            "resolver": "DenyAllResolver",
+            "standing_basis": "deny_default",
+            "scope": [],
+            "audience": "nq:main",
+            "evaluated_at": "2026-05-27T12:00:00Z",
+            "expires_at": null
+        });
+
+        let d: StandingDecision = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(d.actor, "");
+        assert_eq!(d.claim_kind, "");
+        assert_eq!(d.subject_scope, "");
+        assert_eq!(d.jti, None);
+        assert_eq!(d.body_digest, None);
+        assert_eq!(d.emitted_receipt_digest, None);
+        assert_eq!(d.reuse_bound, None);
+        assert_eq!(d.certified_sound, None);
     }
 
     // -- StaticConfigResolver --------------------------------------------

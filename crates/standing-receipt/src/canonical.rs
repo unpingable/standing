@@ -20,10 +20,8 @@ pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Er
 fn sort_keys(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
-            let sorted: serde_json::Map<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), sort_keys(v)))
-                .collect();
+            let sorted: serde_json::Map<String, Value> =
+                map.iter().map(|(k, v)| (k.clone(), sort_keys(v))).collect();
             Value::Object(sorted)
         }
         Value::Array(arr) => Value::Array(arr.iter().map(sort_keys).collect()),

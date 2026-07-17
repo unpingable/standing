@@ -1,4 +1,4 @@
-//! Assertion-standing preflight surface — Phase 4a "door, not room."
+//! Assertion-standing preflight surface — the pure effect-class door.
 //!
 //! A consumer (NQ, Wicket, Nightshift, AG) about to bind or mutate downstream
 //! state asks Standing:
@@ -8,15 +8,10 @@
 //!
 //! Standing answers honestly. For descriptive / advisory effects, act-standing
 //! (workload identity + local grant) is sufficient — assert-standing is not
-//! required. For binding / mutating effects, assert-standing IS required —
-//! and as of Phase 4a, the `AssertionGrant` lease lifecycle is not yet
-//! installed, so the answer is a structured *cannot testify yet* refusal.
-//!
-//! This is the **forcing-case detector** for Phase 4b (the lease lifecycle):
-//! a consumer that calls `check_assert` for a binding effect and receives
-//! `RequiredNotImplemented` has the citable forcing case the lifecycle build
-//! needs. Until that happens, the door is open, the room is unbuilt, and the
-//! absence is observable.
+//! required. For binding / mutating effects, assert-standing IS required. The
+//! pure [`check_assert`] door reports that requirement without consulting a
+//! store; the store-backed preview/spend resolvers then upgrade that sentinel
+//! to a lease-backed availability or refusal decision.
 //!
 //! **This module does not authorize.** It does not mint, persist, lease, or
 //! emit receipts. It is read-only inquiry against the existing instance
@@ -96,10 +91,10 @@ impl AssertCheckRequest {
 
 /// Standing's structured answer to the preflight.
 ///
-/// Two variants in Phase 4a. Future iterations will add `RequiredAndAvailable`
-/// (when the AssertionGrant lifecycle lands) and `RequiredButDenied`
-/// (when a grant exists but the request falls outside its scope).
-/// Consumers MUST treat unknown variants as conservative refusal.
+/// The pure door returns `NotRequired` or `RequiredNotImplemented`; store-backed
+/// resolution upgrades the latter to `RequiredAndAvailable` or
+/// `RequiredButDenied`. Consumers MUST treat unknown variants as conservative
+/// refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssertCheckDecision {
@@ -107,9 +102,9 @@ pub enum AssertCheckDecision {
     /// assert-standing is not required. The consumer may proceed under
     /// its existing act-standing posture.
     NotRequired,
-    /// Effect is binding or mutating. Assert-standing IS required for this
-    /// kind of operation, but Standing has no `AssertionGrant` lease
-    /// lifecycle installed yet. Refusal is structural, not stylistic.
+    /// Effect is binding or mutating. Assert-standing IS required, but this
+    /// pure check has not consulted the assertion-lease store. Store-backed
+    /// resolution consumes this sentinel; consumers must not authorize from it.
     RequiredNotImplemented,
     /// Effect requires assert-standing, a lease covers this request, and it is
     /// fresh (scope-covered, within-validity, not-replayed, budget-remaining).
@@ -133,6 +128,9 @@ pub mod assert_basis {
     pub const ASSERTION_AVAILABLE: &str = "assertion_available";
     /// No covering lease exists for this actor/audience.
     pub const NO_COVERING_LEASE: &str = "no_covering_lease";
+    /// The preflight request and request proof disagree. The concrete decision
+    /// appends the mismatch axis, e.g. `request_proof_mismatch:principal_actor`.
+    pub const REQUEST_PROOF_MISMATCH: &str = "request_proof_mismatch";
 }
 
 /// Cited authority context. Both fields are optional because an instance
@@ -188,15 +186,31 @@ pub struct AssertCheckResult {
     pub why: AssertCheckWhy,
     /// Echoed back from the request so receipts and audit trails on the
     /// consumer side can compose without re-threading.
+    #[serde(default)]
+    pub principal: String,
     pub consumer: String,
     pub claim_kind: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<EffectClass>,
+    /// Exact proof bindings, populated by store-backed resolution. They remain
+    /// present on refusal so the result cannot be detached from the proof it
+    /// assessed. The pure effect-class door has no proof and leaves them empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_digest: Option<String>,
 }
 
 /// The preflight check itself.
 ///
 /// Pure function: takes a request plus optional cited-authority strings,
 /// returns a decision. Does not touch the store, does not emit receipts,
-/// does not authorize. Phase 4a in one screen.
+/// does not authorize. Store-backed callers resolve the returned sentinel
+/// against a concrete request proof before treating standing as available.
 pub fn check_assert(
     request: &AssertCheckRequest,
     genesis_digest: Option<&str>,
@@ -223,8 +237,14 @@ pub fn check_assert(
                        assert-standing is not required for this effect class."
                     .into(),
             },
+            principal: request.principal.clone(),
             consumer: request.consumer.clone(),
             claim_kind: request.claim_kind.clone(),
+            target: request.target.clone(),
+            effect: Some(request.effect),
+            grant_id: None,
+            jti: None,
+            body_digest: None,
         },
         EffectClass::Binding | EffectClass::Mutating => {
             let required_for = match request.effect {
@@ -247,15 +267,20 @@ pub fn check_assert(
                 why: AssertCheckWhy {
                     genesis: genesis_digest.map(String::from),
                     policy: policy_hash.map(String::from),
-                    note: "Standing has no AssertionGrant lease lifecycle installed (Phase 4b). \
-                           Binding and mutating effects require assert-standing the tool cannot \
-                           yet issue. The consumer should either (a) defer the binding action, \
-                           (b) run the operation under visible_not_binding posture, or \
-                           (c) wait for Phase 4b. See docs/remote-standing-boundary.md."
+                    note: "Binding and mutating effects require assertion standing. This pure \
+                           preflight checks only the effect gate and does not consult the lease \
+                           store. The consumer must use store-backed preview/spend resolution; \
+                           only a spend result with authorizes_effect=true may authorize."
                         .into(),
                 },
+                principal: request.principal.clone(),
                 consumer: request.consumer.clone(),
                 claim_kind: request.claim_kind.clone(),
+                target: request.target.clone(),
+                effect: Some(request.effect),
+                grant_id: None,
+                jti: None,
+                body_digest: None,
             }
         }
     }
@@ -296,7 +321,11 @@ mod tests {
 
     #[test]
     fn binding_effect_refused_as_not_implemented() {
-        let r = check_assert(&req(EffectClass::Binding), Some("gen-digest"), Some("pol-hash"));
+        let r = check_assert(
+            &req(EffectClass::Binding),
+            Some("gen-digest"),
+            Some("pol-hash"),
+        );
         assert_eq!(r.decision, AssertCheckDecision::RequiredNotImplemented);
         assert_eq!(r.reason, assert_basis::ASSERTION_STANDING_NOT_IMPLEMENTED);
         assert_eq!(r.required_for.as_deref(), Some("binding_claim"));
@@ -338,16 +367,47 @@ mod tests {
     }
 
     #[test]
-    fn result_echoes_consumer_and_claim_kind() {
+    fn result_echoes_exact_request() {
         let r = check_assert(&req(EffectClass::Binding), None, None);
+        assert_eq!(r.principal, "component:nq:linode");
         assert_eq!(r.consumer, "nq:linode");
         assert_eq!(r.claim_kind, "sqlite_wal_state");
+        assert_eq!(r.target, "labelwatch/foo");
+        assert_eq!(r.effect, Some(EffectClass::Binding));
+        assert_eq!(r.grant_id, None);
+        assert_eq!(r.jti, None);
+        assert_eq!(r.body_digest, None);
+    }
+
+    #[test]
+    fn new_result_echoes_default_when_deserializing_legacy_shape() {
+        let mut legacy =
+            serde_json::to_value(check_assert(&req(EffectClass::Binding), None, None)).unwrap();
+        let fields = legacy.as_object_mut().unwrap();
+        fields.remove("principal");
+        fields.remove("target");
+        fields.remove("effect");
+        fields.remove("grant_id");
+        fields.remove("jti");
+        fields.remove("body_digest");
+
+        let r: AssertCheckResult = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(r.principal, "");
+        assert_eq!(r.target, "");
+        assert_eq!(r.effect, None);
+        assert_eq!(r.grant_id, None);
+        assert_eq!(r.jti, None);
+        assert_eq!(r.body_digest, None);
     }
 
     #[test]
     fn why_is_present_even_when_inputs_are_none() {
         let r = check_assert(&req(EffectClass::Descriptive), None, None);
-        assert!(!r.why.note.is_empty(), "operator-readable note always present");
+        assert!(
+            !r.why.note.is_empty(),
+            "operator-readable note always present"
+        );
     }
 
     #[test]

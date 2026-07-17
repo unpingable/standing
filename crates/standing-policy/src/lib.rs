@@ -12,17 +12,17 @@ pub mod resolver;
 
 pub use config::{MatchOutcome, MismatchReason, StaticConfig, StaticConfigEntry};
 pub use preflight::{
-    assert_basis, check_assert, AssertCheckDecision, AssertCheckRequest, AssertCheckResult,
-    AssertCheckWhy, EffectClass,
+    AssertCheckDecision, AssertCheckRequest, AssertCheckResult, AssertCheckWhy, EffectClass,
+    assert_basis, check_assert,
 };
 pub use resolver::{
-    basis, DenyAllResolver, LocalOnlyResolver, ResolveError, ResolverMode, StandingDecision,
-    StandingRequest, StandingResolver, StandingVerdict, StaticConfigResolver,
+    DenyAllResolver, LocalOnlyResolver, ResolveError, ResolverMode, StandingDecision,
+    StandingRequest, StandingResolver, StandingVerdict, StaticConfigResolver, basis,
 };
 
 use sha2::{Digest, Sha256};
 use standing_grant::GrantRequest;
-use standing_receipt::{ReceiptBuilder, ReceiptKind, Receipt, ReceiptError};
+use standing_receipt::{Receipt, ReceiptBuilder, ReceiptError, ReceiptKind};
 
 /// The verdict of a policy evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -95,10 +95,7 @@ impl PolicyEvaluator for HardcodedPolicy {
         } else if request.duration_secs > 3600 {
             (
                 Verdict::Deny,
-                format!(
-                    "duration {}s exceeds max 3600s",
-                    request.duration_secs
-                ),
+                format!("duration {}s exceeds max 3600s", request.duration_secs),
             )
         } else {
             (Verdict::Allow, "all checks passed".to_string())
@@ -165,7 +162,9 @@ mod tests {
     fn allows_valid_request() {
         let policy = HardcodedPolicy;
         let req = make_request("deploy-bot", "deploy", "prod/web", 300);
-        let decision = policy.evaluate(&req, "test-grant-id", &fake_parent()).unwrap();
+        let decision = policy
+            .evaluate(&req, "test-grant-id", &fake_parent())
+            .unwrap();
         assert_eq!(decision.verdict, Verdict::Allow);
     }
 
@@ -173,7 +172,9 @@ mod tests {
     fn denies_excessive_duration() {
         let policy = HardcodedPolicy;
         let req = make_request("bot", "deploy", "prod", 7200);
-        let decision = policy.evaluate(&req, "test-grant-id", &fake_parent()).unwrap();
+        let decision = policy
+            .evaluate(&req, "test-grant-id", &fake_parent())
+            .unwrap();
         assert_eq!(decision.verdict, Verdict::Deny);
         assert!(decision.reason.contains("exceeds max"));
     }
@@ -182,7 +183,9 @@ mod tests {
     fn denies_empty_subject() {
         let policy = HardcodedPolicy;
         let req = make_request("", "deploy", "prod", 300);
-        let decision = policy.evaluate(&req, "test-grant-id", &fake_parent()).unwrap();
+        let decision = policy
+            .evaluate(&req, "test-grant-id", &fake_parent())
+            .unwrap();
         assert_eq!(decision.verdict, Verdict::Deny);
     }
 

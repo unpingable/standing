@@ -14,17 +14,18 @@ mod store_resolver;
 pub use store_resolver::StoreResolver;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{Connection, Transaction, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use standing_grant::{
-    assertion_covers, ActorContext, AssertCoverage, AssertionGrant, AssertionGrantState,
-    AssertionScope, GrantScope, GrantState, Principal, PrincipalRole, RequestProof, WindowState,
-    auth,
-};
-use standing_receipt::{Receipt, ReceiptBuilder, ReceiptKind};
 use chrono::Duration;
+use standing_grant::{
+    ActorContext, AssertCoverage, AssertionGrant, AssertionGrantMachine, AssertionGrantRequest,
+    AssertionGrantState, AssertionScope, GrantError, GrantMachine, GrantRequest, GrantScope,
+    GrantState, Principal, PrincipalRole, RequestProof, WindowState, assertion_covers, auth,
+};
+use standing_policy::{PolicyError, PolicyEvaluator, Verdict};
+use standing_receipt::{Receipt, ReceiptBuilder, ReceiptKind};
 
 /// Errors from the store.
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +39,15 @@ pub enum StoreError {
     #[error("receipt error: {0}")]
     Receipt(#[from] standing_receipt::ReceiptError),
 
+    #[error("grant lifecycle error: {0}")]
+    Grant(#[from] GrantError),
+
+    #[error("policy evaluation error: {0}")]
+    Policy(#[from] PolicyError),
+
+    #[error("policy witness does not match its decision field {field}")]
+    PolicyWitnessMismatch { field: String },
+
     #[error("receipt write failed, aborting state transition")]
     ReceiptWriteFailed,
 
@@ -47,13 +57,22 @@ pub enum StoreError {
     #[error("invalid transition: cannot go from {from} to {to}")]
     InvalidTransition { from: String, to: String },
 
+    #[error("receipt kind mismatch for {transition}: expected {expected}, got {actual}")]
+    ReceiptKindMismatch {
+        transition: String,
+        expected: String,
+        actual: String,
+    },
+
     #[error("grant expired at {0}")]
     GrantExpired(String),
 
     #[error("grant not yet valid (not_before {0})")]
     GrantNotYetValid(String),
 
-    #[error("grant expiry timestamp is unparseable ({0}); refusing rather than treating an unreadable expiry as valid")]
+    #[error(
+        "grant expiry timestamp is unparseable ({0}); refusing rather than treating an unreadable expiry as valid"
+    )]
     GrantTimeUnparseable(String),
 
     #[error("scope mismatch: grant authorizes {granted}, attempted {attempted}")]
@@ -66,8 +85,20 @@ pub enum StoreError {
         transition: String,
     },
 
-    #[error("genesis already installed for this instance (digest {0}); a second install would contradict the chain root")]
+    #[error(
+        "genesis already installed for this instance (digest {0}); a second install would contradict the chain root"
+    )]
     GenesisExists(String),
+
+    #[error("{operation} requires an installed genesis operator")]
+    GenesisRequired { operation: String },
+
+    #[error("{operation} requires genesis operator {expected}, got {actual}")]
+    GenesisOperatorMismatch {
+        operation: String,
+        expected: String,
+        actual: String,
+    },
 
     // -- assertion-lease (Phase 4b) --------------------------------------
     #[error("assertion grant not found: {0}")]
@@ -82,7 +113,9 @@ pub enum StoreError {
     #[error("assertion lease not yet valid (not_before {0})")]
     AssertionNotYetValid(String),
 
-    #[error("assertion lease window is incoherent or its stored timestamps are unparseable; refusing rather than guessing")]
+    #[error(
+        "assertion lease window is incoherent or its stored timestamps are unparseable; refusing rather than guessing"
+    )]
     AssertionWindowIncoherent,
 
     #[error("assertion lease use budget exhausted (max_uses {max_uses})")]
@@ -94,14 +127,21 @@ pub enum StoreError {
     #[error("assertion proof MAC invalid or missing — the per-request envelope is not authentic")]
     AssertionMacInvalid,
 
-    #[error("assertion proof clock skew exceeded: issued_at is {0}s in the future beyond tolerance")]
+    #[error(
+        "assertion proof clock skew exceeded: issued_at is {0}s in the future beyond tolerance"
+    )]
     ClockSkewExceeded(i64),
 
     #[error("assertion proof timestamp out of window: {0}s old, beyond the freshness horizon")]
     RequestTimestampOutOfWindow(i64),
 
-    #[error("cannot issue an assertion lease with no genesis installed; issuance requires a prior settlement-witness")]
+    #[error(
+        "cannot issue an assertion lease with no genesis installed; issuance requires a prior settlement-witness"
+    )]
     AssertionNoGenesis,
+
+    #[error("assertion speaker {0} cannot authorize its own lease")]
+    AssertionSelfGrant(String),
 
     #[error("class frozen: {handle} ({reason})")]
     ClassFrozen { handle: String, reason: String },
@@ -322,16 +362,231 @@ impl Store {
         }
     }
 
-    /// Low-level: store a receipt and update grant state atomically.
+    /// Authorize assertion issuance against the immutable genesis operator.
+    /// The operator and lease actor are deliberately separate principals: the
+    /// speaker cannot mint its own standing.
+    pub fn authorize_assertion_issuance(
+        &self,
+        operator: &str,
+        lease_actor: &str,
+    ) -> Result<ReceiptRow, StoreError> {
+        let genesis = self.get_genesis()?.ok_or(StoreError::AssertionNoGenesis)?;
+        if genesis.actor != operator {
+            return Err(StoreError::GenesisOperatorMismatch {
+                operation: "assertion lease issuance".to_string(),
+                expected: genesis.actor,
+                actual: operator.to_string(),
+            });
+        }
+        if operator == lease_actor {
+            return Err(StoreError::AssertionSelfGrant(lease_actor.to_string()));
+        }
+        Ok(genesis)
+    }
+
+    fn require_genesis_operator(
+        &self,
+        operator: &str,
+        operation: &str,
+    ) -> Result<ReceiptRow, StoreError> {
+        let genesis = self
+            .get_genesis()?
+            .ok_or_else(|| StoreError::GenesisRequired {
+                operation: operation.to_string(),
+            })?;
+        if genesis.actor != operator {
+            return Err(StoreError::GenesisOperatorMismatch {
+                operation: operation.to_string(),
+                expected: genesis.actor,
+                actual: operator.to_string(),
+            });
+        }
+        Ok(genesis)
+    }
+
+    /// Evaluate and persist a complete entitlement-to-act creation flow.
+    ///
+    /// The request, policy decision, and issue/deny receipts are constructed
+    /// by their domain owners, verified as one linear chain, and committed in
+    /// the same SQLite transaction as the resulting grant row. Act grants
+    /// remain valid on pre-genesis instances for compatibility; when genesis
+    /// exists, the request receipt is rooted at it.
+    pub fn create_grant(
+        &mut self,
+        request: &GrantRequest,
+        policy: &dyn PolicyEvaluator,
+    ) -> Result<GrantCreationResult, StoreError> {
+        let genesis_digest = self.get_genesis()?.map(|row| row.digest);
+        let mut machine = GrantMachine::request_rooted(request, genesis_digest.as_deref())?;
+        let grant_id = machine.grant_id();
+        let requested_receipt = machine.chain.tip().clone();
+
+        let decision =
+            policy.evaluate(request, &grant_id.to_string(), &requested_receipt.digest)?;
+        let policy_receipt = decision.receipt.clone();
+        validate_receipt_kind(
+            "grant request policy witness",
+            &ReceiptKind::PolicyDecision,
+            &policy_receipt.kind,
+        )?;
+        if policy_receipt.policy_hash.as_deref() != Some(decision.policy_hash.as_str()) {
+            return Err(StoreError::PolicyWitnessMismatch {
+                field: "policy_hash".to_string(),
+            });
+        }
+        let verdict_name = match &decision.verdict {
+            Verdict::Allow => "allow",
+            Verdict::Deny => "deny",
+        };
+        if policy_receipt.evidence["verdict"].as_str() != Some(verdict_name) {
+            return Err(StoreError::PolicyWitnessMismatch {
+                field: "verdict".to_string(),
+            });
+        }
+        machine.chain.append(policy_receipt.clone())?;
+
+        let (final_receipt, expires_at) = match decision.verdict {
+            Verdict::Allow => {
+                machine.issue(
+                    request.duration_secs,
+                    &decision.policy_hash,
+                    serde_json::json!({
+                        "verdict": "allow",
+                        "reason": decision.reason.clone(),
+                    }),
+                )?;
+                let grant = machine
+                    .grant
+                    .as_ref()
+                    .expect("issued GrantMachine always contains its grant");
+                (machine.chain.tip().clone(), Some(grant.expires_at))
+            }
+            Verdict::Deny => {
+                machine.deny(
+                    &decision.policy_hash,
+                    serde_json::json!({
+                        "verdict": "deny",
+                        "reason": decision.reason.clone(),
+                    }),
+                )?;
+                (machine.chain.tip().clone(), None)
+            }
+        };
+        machine.chain.verify()?;
+
+        let state = machine.state.clone();
+        let issued_at = machine.grant.as_ref().map(|grant| grant.issued_at);
+        let tx = self.conn.transaction()?;
+        insert_receipt(&tx, &requested_receipt)?;
+        insert_receipt(&tx, &policy_receipt)?;
+        insert_receipt(&tx, &final_receipt)?;
+        tx.execute(
+            "INSERT INTO grants
+                (id, subject_id, actor, action, target, state, issued_at,
+                 expires_at, not_before, latest_receipt_digest, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+            params![
+                grant_id.to_string(),
+                &request.subject.id,
+                &request.subject.label,
+                &request.scope.action,
+                &request.scope.target,
+                state.to_string(),
+                issued_at.map(|time| time.to_rfc3339()),
+                expires_at.map(|time| time.to_rfc3339()),
+                request.not_before.map(|time| time.to_rfc3339()),
+                &final_receipt.digest,
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(GrantCreationResult {
+            grant_id,
+            state,
+            reason: decision.reason,
+            final_receipt,
+            expires_at,
+        })
+    }
+
+    /// Create and issue an assertion lease under the installed genesis.
+    ///
+    /// The operator is checked against genesis and must differ from the lease
+    /// actor. Requested and issued receipts plus the authoritative row are
+    /// committed atomically, so public callers cannot import an already-issued
+    /// row or choose its receipt kind/parent independently.
+    pub fn create_assertion_lease(
+        &mut self,
+        request: &AssertionGrantRequest,
+        operator: &Principal,
+    ) -> Result<AssertionLeaseCreationResult, StoreError> {
+        let genesis = self.authorize_assertion_issuance(&operator.id, &request.actor.id)?;
+        let mut machine = AssertionGrantMachine::request_rooted(request, Some(&genesis.digest))?;
+        let grant_id = machine.grant_id();
+        let requested_receipt = machine.chain.tip().clone();
+        let policy_hash = genesis.policy_hash.clone().unwrap_or_default();
+        machine.issue(
+            operator,
+            &genesis.digest,
+            &policy_hash,
+            serde_json::json!({
+                "basis": "operator_issued_under_genesis",
+                "operator_id": operator.id,
+                "lease_actor": request.actor.id,
+            }),
+        )?;
+        machine.chain.verify()?;
+
+        let issued_receipt = machine.chain.tip().clone();
+        let grant = machine
+            .grant
+            .clone()
+            .expect("issued AssertionGrantMachine always contains its grant");
+        let tx = self.conn.transaction()?;
+        insert_receipt(&tx, &requested_receipt)?;
+        insert_receipt(&tx, &issued_receipt)?;
+        tx.execute(
+            "INSERT INTO assertion_grants
+                (id, actor, claim_kind, subject_scope, audience, state,
+                 not_before, issued_at, expires_at, max_uses, spend_count,
+                 latest_receipt_digest, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'issued', ?6, ?7, ?8, ?9, 0, ?10,
+                     datetime('now'))",
+            params![
+                grant_id.to_string(),
+                &grant.actor.id,
+                &grant.scope.claim_kind,
+                &grant.scope.subject_scope,
+                &grant.scope.audience,
+                grant.not_before.to_rfc3339(),
+                grant.issued_at.to_rfc3339(),
+                grant.expires_at.to_rfc3339(),
+                grant.max_uses.map(|uses| uses as i64),
+                &issued_receipt.digest,
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(AssertionLeaseCreationResult {
+            grant_id,
+            grant,
+            issued_receipt,
+            genesis_digest: genesis.digest,
+            operator_id: operator.id.clone(),
+        })
+    }
+
+    /// Internal fixture/setup path: store a receipt and update grant state.
     /// Fail-closed: if receipt write fails, the grant state does not change.
     ///
-    /// **This method does NOT validate transitions.** It is used only during
-    /// grant creation (the `grant request` flow that goes through GrantMachine)
-    /// and in tests to set up specific states.
+    /// **This method does NOT validate transitions.** It is restricted to this
+    /// crate's tests and fixture helpers. Public callers use
+    /// [`Store::create_grant`] or [`Store::transition`].
     ///
     /// For all other mutations, use `Store::transition()` — the only legal
     /// mutation path that enforces adjacency, contextual guards, and CAS.
-    pub fn record_transition(
+    #[cfg(test)]
+    pub(crate) fn record_transition(
         &mut self,
         grant_id: Uuid,
         state: &GrantState,
@@ -454,17 +709,8 @@ impl Store {
 
     /// Checked, atomic state transition with CAS semantics.
     ///
-    /// This is the domain-level API. It:
-    /// 1. Reads current grant state and head digest
-    /// 2. Validates the transition is legal (adjacency via GrantState)
-    /// 3. Applies contextual guards (expiry check)
-    /// 4. Builds a receipt chained to the current head
-    /// 5. Commits receipt + state update atomically, conditional on head not having changed
-    ///
-    /// Returns the new receipt on success.
-    /// Checked, atomic state transition with CAS semantics.
-    ///
-    /// **This is the only legal mutation path for grant state.**
+    /// This is the only public post-creation mutation path for grant state;
+    /// [`Store::create_grant`] owns the atomic creation flow.
     ///
     /// It:
     /// 1. Reads current grant state and head digest (inside transaction)
@@ -485,7 +731,13 @@ impl Store {
         policy_hash: Option<&str>,
     ) -> Result<TransitionResult, StoreError> {
         self.transition_inner(
-            grant_id, target_state, receipt_kind, actor_ctx, evidence, policy_hash, None,
+            grant_id,
+            target_state,
+            receipt_kind,
+            actor_ctx,
+            evidence,
+            policy_hash,
+            None,
         )
     }
 
@@ -506,7 +758,12 @@ impl Store {
         attempted: &GrantScope,
     ) -> Result<TransitionResult, StoreError> {
         self.transition_inner(
-            grant_id, target_state, receipt_kind, actor_ctx, evidence, policy_hash,
+            grant_id,
+            target_state,
+            receipt_kind,
+            actor_ctx,
+            evidence,
+            policy_hash,
             Some(attempted),
         )
     }
@@ -547,12 +804,14 @@ impl Store {
         };
 
         // Step 2: Validate adjacency
-        let current_state = GrantState::from_str(&grant.state).ok_or_else(|| {
-            StoreError::InvalidTransition {
-                from: grant.state.clone(),
-                to: target_state.to_string(),
-            }
-        })?;
+        let current_state =
+            grant
+                .state
+                .parse::<GrantState>()
+                .map_err(|_| StoreError::InvalidTransition {
+                    from: grant.state.clone(),
+                    to: target_state.to_string(),
+                })?;
 
         if !current_state.can_transition_to(&target_state) {
             return Err(StoreError::InvalidTransition {
@@ -560,6 +819,11 @@ impl Store {
                 to: target_state.to_string(),
             });
         }
+
+        // The state and receipt kind describe the same event and therefore
+        // cannot be selected independently. Refuse before building or writing
+        // a receipt if the caller presents a mismatched pair.
+        validate_grant_receipt_kind(&current_state, &target_state, &receipt_kind)?;
 
         // Step 3: Validate authorization
         if !auth::is_authorized(&current_state, &target_state, actor_ctx.role) {
@@ -572,9 +836,7 @@ impl Store {
 
         // Step 3b: Subject binding — if acting as Subject, principal must
         // match the grant's bound subject_id
-        if actor_ctx.role == PrincipalRole::Subject
-            && actor_ctx.principal.id != grant.subject_id
-        {
+        if actor_ctx.role == PrincipalRole::Subject && actor_ctx.principal.id != grant.subject_id {
             return Err(StoreError::Unauthorized {
                 actor: actor_ctx.principal.id.clone(),
                 role: "subject (wrong principal)".to_string(),
@@ -588,42 +850,46 @@ impl Store {
         // wrong-target presentation cannot burn a single-use grant). Standing owns this
         // refusal; a consumer adapting the grant inherits it rather than inventing it.
         if let Some(att) = attempted_scope
-            && (att.action != grant.action || att.target != grant.target) {
-                return Err(StoreError::ScopeMismatch {
-                    granted: format!("{}/{}", grant.action, grant.target),
-                    attempted: format!("{}/{}", att.action, att.target),
-                });
-            }
+            && (att.action != grant.action || att.target != grant.target)
+        {
+            return Err(StoreError::ScopeMismatch {
+                granted: format!("{}/{}", grant.action, grant.target),
+                attempted: format!("{}/{}", att.action, att.target),
+            });
+        }
 
         // Step 3d: Policy freeze (incident mode). An authorizing transition
         // (Active/Used) on a frozen action/actor class is refused with
         // class_frozen — before any write (non-consuming), and the grant record
         // is untouched (deny-overlay, not a state change). Audience-scoped
         // freezes don't apply to act-grants (they carry no audience).
-        if matches!(target_state, GrantState::Active | GrantState::Used) {
-            if let Some(f) = find_active_freeze(&tx, Utc::now(), |f| {
+        if matches!(target_state, GrantState::Active | GrantState::Used)
+            && let Some(f) = find_active_freeze(&tx, Utc::now(), |f| {
                 f.audience_scope.is_none()
                     && match f.class_type.as_str() {
                         "action" => f.class_value == grant.action,
                         "actor" => f.class_value == grant.subject_id,
                         _ => false,
                     }
-            })? {
-                return Err(StoreError::ClassFrozen { handle: f.handle, reason: f.reason });
-            }
+            })?
+        {
+            return Err(StoreError::ClassFrozen {
+                handle: f.handle,
+                reason: f.reason,
+            });
         }
 
         // Step 3e: not_before window. An authorizing transition before the
         // grant's validity window opens is refused (fail-closed on unparseable
         // time, same discipline as expiry).
-        if matches!(target_state, GrantState::Active | GrantState::Used) {
-            if let Some(ref nb_str) = grant.not_before {
-                let nb = DateTime::parse_from_rfc3339(nb_str)
-                    .map(|t| t.to_utc())
-                    .map_err(|_| StoreError::GrantTimeUnparseable(nb_str.clone()))?;
-                if Utc::now() < nb {
-                    return Err(StoreError::GrantNotYetValid(nb_str.clone()));
-                }
+        if matches!(target_state, GrantState::Active | GrantState::Used)
+            && let Some(ref nb_str) = grant.not_before
+        {
+            let nb = DateTime::parse_from_rfc3339(nb_str)
+                .map(|t| t.to_utc())
+                .map_err(|_| StoreError::GrantTimeUnparseable(nb_str.clone()))?;
+            if Utc::now() < nb {
+                return Err(StoreError::GrantNotYetValid(nb_str.clone()));
             }
         }
 
@@ -673,7 +939,12 @@ impl Store {
         let rows_updated = tx.execute(
             "UPDATE grants SET state = ?1, latest_receipt_digest = ?2, updated_at = datetime('now')
              WHERE id = ?3 AND latest_receipt_digest = ?4",
-            params![target_state_str, receipt.digest, grant_id, grant.head_digest],
+            params![
+                target_state_str,
+                receipt.digest,
+                grant_id,
+                grant.head_digest
+            ],
         )?;
 
         if rows_updated == 0 {
@@ -741,20 +1012,76 @@ const PROOF_MAX_SKEW_SECS: i64 = 30;
 /// this, the request is out of the freshness window regardless of MAC validity.
 const PROOF_MAX_AGE_SECS: i64 = 300;
 
+/// Keep assertion replay nonces for a short grace after lease expiry so clock
+/// disagreement cannot reopen a just-expired replay window.
+const ASSERTION_JTI_PURGE_SKEW_SECS: i64 = 30;
+
+fn validate_grant_receipt_kind(
+    from: &GrantState,
+    to: &GrantState,
+    actual: &ReceiptKind,
+) -> Result<(), StoreError> {
+    let expected = match to {
+        GrantState::Requested => ReceiptKind::GrantRequested,
+        GrantState::Issued => ReceiptKind::GrantIssued,
+        GrantState::Denied => ReceiptKind::GrantDenied,
+        GrantState::Active => ReceiptKind::GrantActivated,
+        GrantState::Used => ReceiptKind::GrantUsed,
+        GrantState::Expired => ReceiptKind::GrantExpired,
+        GrantState::Revoked => ReceiptKind::GrantRevoked,
+        GrantState::Abandoned => ReceiptKind::GrantAbandoned,
+    };
+    validate_receipt_kind(&format!("{} -> {}", from, to), &expected, actual)
+}
+
+fn validate_assertion_receipt_kind(
+    from: &AssertionGrantState,
+    to: &AssertionGrantState,
+    actual: &ReceiptKind,
+) -> Result<(), StoreError> {
+    let expected = match (from, to) {
+        (AssertionGrantState::Active, AssertionGrantState::Active) => ReceiptKind::AssertionMade,
+        (_, AssertionGrantState::Requested) => ReceiptKind::AssertionGrantRequested,
+        (_, AssertionGrantState::Issued) => ReceiptKind::AssertionGrantIssued,
+        (_, AssertionGrantState::Denied) => ReceiptKind::AssertionGrantDenied,
+        (_, AssertionGrantState::Active) => ReceiptKind::AssertionGrantActivated,
+        (_, AssertionGrantState::Expired) => ReceiptKind::AssertionGrantExpired,
+        (_, AssertionGrantState::Revoked) => ReceiptKind::AssertionGrantRevoked,
+        (_, AssertionGrantState::Exhausted) => ReceiptKind::AssertionGrantExhausted,
+    };
+    validate_receipt_kind(&format!("{} -> {}", from, to), &expected, actual)
+}
+
+fn validate_receipt_kind(
+    transition: &str,
+    expected: &ReceiptKind,
+    actual: &ReceiptKind,
+) -> Result<(), StoreError> {
+    if expected != actual {
+        return Err(StoreError::ReceiptKindMismatch {
+            transition: transition.to_string(),
+            expected: format!("{expected:?}"),
+            actual: format!("{actual:?}"),
+        });
+    }
+    Ok(())
+}
+
 /// Compute the canonical MAC tag for a request proof: HMAC-SHA256 over the
 /// canonical JSON of the proof's fixed signed body (the field set pinned in
 /// Wave 1, amendment #4).
 fn proof_mac(proof: &RequestProof, secret: &[u8]) -> Result<String, StoreError> {
-    let bytes = standing_receipt::canonical_json(&proof.canonical_body())
-        .map_err(StoreError::Json)?;
+    let bytes =
+        standing_receipt::canonical_json(&proof.canonical_body()).map_err(StoreError::Json)?;
     Ok(standing_identity::hmac_hex(secret, &bytes))
 }
 
 impl Store {
-    /// Unchecked setup path for assertion leases (mirror of
-    /// [`Store::record_transition`]). Used by the `assert grant` flow to persist
-    /// the request→issue receipts. Does NOT validate transitions.
-    pub fn record_assertion_transition(
+    /// Unchecked assertion-lease fixture path. This is crate-private so a
+    /// library caller cannot import authority around
+    /// [`Store::create_assertion_lease`] / [`Store::transition_assertion`].
+    #[cfg(test)]
+    pub(crate) fn record_assertion_transition(
         &mut self,
         grant_id: Uuid,
         state: &AssertionGrantState,
@@ -807,7 +1134,10 @@ impl Store {
     }
 
     /// Get an assertion lease's current row.
-    pub fn get_assertion_grant(&self, grant_id: &str) -> Result<Option<AssertionGrantRow>, StoreError> {
+    pub fn get_assertion_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<AssertionGrantRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, actor, claim_kind, subject_scope, audience, state, not_before,
                     issued_at, expires_at, max_uses, spend_count, latest_receipt_digest
@@ -863,6 +1193,7 @@ impl Store {
     /// Checked lifecycle transition for an assertion lease (activate / revoke /
     /// expire / deny). NOT a spend — see [`Store::spend_assertion`] for the
     /// `Active → Active` self-loop. Mirrors [`Store::transition`] with CAS.
+    #[allow(clippy::too_many_arguments)]
     pub fn transition_assertion(
         &mut self,
         grant_id: &str,
@@ -873,17 +1204,50 @@ impl Store {
         policy_hash: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<Receipt, StoreError> {
+        if target_state == AssertionGrantState::Issued {
+            self.require_genesis_operator(&actor_ctx.principal.id, "assertion lease issuance")?;
+        }
         let tx = self.conn.transaction()?;
         let snap = read_assertion_snapshot(&tx, grant_id)?;
 
-        let current = AssertionGrantState::from_str(&snap.state).ok_or_else(|| {
-            StoreError::InvalidTransition { from: snap.state.clone(), to: target_state.to_string() }
+        let current = snap.state.parse::<AssertionGrantState>().map_err(|_| {
+            StoreError::InvalidTransition {
+                from: snap.state.clone(),
+                to: target_state.to_string(),
+            }
         })?;
         if !current.can_transition_to(&target_state) {
             return Err(StoreError::InvalidTransition {
                 from: current.to_string(),
                 to: target_state.to_string(),
             });
+        }
+
+        // Active -> Active is a spend, not a generic lifecycle mutation. The
+        // dedicated spend path owns proof, replay, window, budget, and CAS
+        // checks; allowing it here would bypass all of them.
+        if current == AssertionGrantState::Active && target_state == AssertionGrantState::Active {
+            return Err(StoreError::InvalidTransition {
+                from: "active (use spend_assertion for the spend self-loop)".to_string(),
+                to: target_state.to_string(),
+            });
+        }
+
+        validate_assertion_receipt_kind(&current, &target_state, &receipt_kind)?;
+
+        if !auth::is_assertion_authorized(&current, &target_state, actor_ctx.role) {
+            return Err(StoreError::Unauthorized {
+                actor: actor_ctx.principal.id.clone(),
+                role: format!("{:?}", actor_ctx.role),
+                transition: format!("{} -> {}", current, target_state),
+            });
+        }
+
+        if current == AssertionGrantState::Requested
+            && target_state == AssertionGrantState::Issued
+            && actor_ctx.principal.id == snap.actor
+        {
+            return Err(StoreError::AssertionSelfGrant(snap.actor));
         }
 
         // Subject binding: a Subject actor may only drive its own lease.
@@ -902,10 +1266,14 @@ impl Store {
             match grant.window_state(now, Duration::zero()) {
                 WindowState::Within => {}
                 WindowState::NotYetValid => {
-                    return Err(StoreError::AssertionNotYetValid(grant.not_before.to_rfc3339()))
+                    return Err(StoreError::AssertionNotYetValid(
+                        grant.not_before.to_rfc3339(),
+                    ));
                 }
                 WindowState::Expired => {
-                    return Err(StoreError::AssertionWindowClosed(grant.expires_at.to_rfc3339()))
+                    return Err(StoreError::AssertionWindowClosed(
+                        grant.expires_at.to_rfc3339(),
+                    ));
                 }
                 WindowState::Incoherent => return Err(StoreError::AssertionWindowIncoherent),
             }
@@ -965,21 +1333,29 @@ impl Store {
         // Policy freeze (incident mode): a deny-overlay checked before any
         // write — non-consuming (L6). The lease is untouched and keeps counting
         // clock-time toward expiry; the freeze only screens the class.
-        if let Some(f) = self.active_freeze_for(&proof.claim_kind, &proof.actor, &proof.audience, now)? {
-            return Err(StoreError::ClassFrozen { handle: f.handle, reason: f.reason });
+        if let Some(f) =
+            self.active_freeze_for(&proof.claim_kind, &proof.actor, &proof.audience, now)?
+        {
+            return Err(StoreError::ClassFrozen {
+                handle: f.handle,
+                reason: f.reason,
+            });
         }
 
         for _attempt in 0..SPEND_CAS_RETRIES {
             let tx = self.conn.transaction()?;
             let snap = read_assertion_snapshot(&tx, &grant_id)?;
 
-            let current = AssertionGrantState::from_str(&snap.state).ok_or_else(|| {
-                StoreError::InvalidTransition { from: snap.state.clone(), to: "active".into() }
+            let current = snap.state.parse::<AssertionGrantState>().map_err(|_| {
+                StoreError::InvalidTransition {
+                    from: snap.state.clone(),
+                    to: "active".into(),
+                }
             })?;
 
             // Must be spendable: Active, or Issued (auto-activate). Anything
             // else (Requested/terminal) refuses.
-            let needs_activation = match current {
+            let needs_activation = match &current {
                 AssertionGrantState::Active => false,
                 AssertionGrantState::Issued => true,
                 AssertionGrantState::Exhausted => {
@@ -990,36 +1366,65 @@ impl Store {
                     return Err(StoreError::InvalidTransition {
                         from: other.to_string(),
                         to: "active (spend)".into(),
-                    })
+                    });
                 }
             };
+
+            if !auth::is_assertion_authorized(
+                &current,
+                &AssertionGrantState::Active,
+                PrincipalRole::Subject,
+            ) {
+                return Err(StoreError::Unauthorized {
+                    actor: proof.actor.clone(),
+                    role: "Subject".to_string(),
+                    transition: format!("{} -> active (spend)", current),
+                });
+            }
 
             let grant = snapshot_to_grant(&snap, &grant_id)?;
 
             // --- refusal checks, all before any write (non-consuming) ---
 
             if proof.actor != grant.actor.id {
-                return Err(StoreError::AssertionOutOfScope { axis: "actor_mismatch".into() });
+                return Err(StoreError::AssertionOutOfScope {
+                    axis: "actor_mismatch".into(),
+                });
             }
-            match assertion_covers(&grant.scope, &proof.claim_kind, &proof.subject_id, &proof.audience) {
+            match assertion_covers(
+                &grant.scope,
+                &proof.claim_kind,
+                &proof.subject_id,
+                &proof.audience,
+            ) {
                 AssertCoverage::Covered => {}
                 AssertCoverage::ClaimKindMismatch => {
-                    return Err(StoreError::AssertionOutOfScope { axis: "claim_kind_out_of_scope".into() })
+                    return Err(StoreError::AssertionOutOfScope {
+                        axis: "claim_kind_out_of_scope".into(),
+                    });
                 }
                 AssertCoverage::SubjectMismatch => {
-                    return Err(StoreError::AssertionOutOfScope { axis: "subject_out_of_scope".into() })
+                    return Err(StoreError::AssertionOutOfScope {
+                        axis: "subject_out_of_scope".into(),
+                    });
                 }
                 AssertCoverage::AudienceMismatch => {
-                    return Err(StoreError::AssertionOutOfScope { axis: "audience_mismatch".into() })
+                    return Err(StoreError::AssertionOutOfScope {
+                        axis: "audience_mismatch".into(),
+                    });
                 }
             }
             match grant.window_state(now, Duration::zero()) {
                 WindowState::Within => {}
                 WindowState::NotYetValid => {
-                    return Err(StoreError::AssertionNotYetValid(grant.not_before.to_rfc3339()))
+                    return Err(StoreError::AssertionNotYetValid(
+                        grant.not_before.to_rfc3339(),
+                    ));
                 }
                 WindowState::Expired => {
-                    return Err(StoreError::AssertionWindowClosed(grant.expires_at.to_rfc3339()))
+                    return Err(StoreError::AssertionWindowClosed(
+                        grant.expires_at.to_rfc3339(),
+                    ));
                 }
                 WindowState::Incoherent => return Err(StoreError::AssertionWindowIncoherent),
             }
@@ -1030,6 +1435,16 @@ impl Store {
             }
 
             // --- replay ledger (single-use jti per audience) ---
+            // Bound the ledger without reopening the expiry boundary: entries
+            // are purgeable only after their recorded lease expiry plus the
+            // same 30-second skew grace used by identity replay handling.
+            let purge_cutoff =
+                (now - Duration::seconds(ASSERTION_JTI_PURGE_SKEW_SECS)).to_rfc3339();
+            tx.execute(
+                "DELETE FROM seen_assertion_jti WHERE expires_at < ?1",
+                params![purge_cutoff],
+            )?;
+
             // INSERT OR IGNORE inside this tx: if the row already exists (a
             // committed prior spend), it's a replay. A CAS-failed retry rolls
             // this back, so the same logical spend can re-insert on retry.
@@ -1209,6 +1624,7 @@ impl Store {
         operator: &str,
         now: DateTime<Utc>,
     ) -> Result<Receipt, StoreError> {
+        self.require_genesis_operator(operator, "policy freeze")?;
         if self.get_freeze(handle)?.is_some() {
             return Err(StoreError::FreezeExists(handle.to_string()));
         }
@@ -1240,10 +1656,20 @@ impl Store {
 
     /// Lift a freeze (explicit thaw). Receipt-bearing; the same grant class is
     /// authorizable again with no re-issue.
-    pub fn thaw_freeze(&mut self, handle: &str, operator: &str, now: DateTime<Utc>) -> Result<Receipt, StoreError> {
-        let f = self.get_freeze(handle)?.ok_or_else(|| StoreError::FreezeNotFound(handle.to_string()))?;
+    pub fn thaw_freeze(
+        &mut self,
+        handle: &str,
+        operator: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Receipt, StoreError> {
+        self.require_genesis_operator(operator, "policy thaw")?;
+        let f = self
+            .get_freeze(handle)?
+            .ok_or_else(|| StoreError::FreezeNotFound(handle.to_string()))?;
         if f.thawed_at.is_some() {
-            return Err(StoreError::FreezeNotFound(format!("{handle} (already thawed)")));
+            return Err(StoreError::FreezeNotFound(format!(
+                "{handle} (already thawed)"
+            )));
         }
         let receipt = ReceiptBuilder::new(ReceiptKind::PolicyThawed, operator, handle)
             .parent_digest(f.freeze_receipt.clone())
@@ -1304,10 +1730,10 @@ impl Store {
         now: DateTime<Utc>,
     ) -> Result<Option<FreezeRow>, StoreError> {
         find_active_freeze(&self.conn, now, |f| {
-            if let Some(scope) = &f.audience_scope {
-                if scope != audience {
-                    return false; // scoped to a different audience (L6)
-                }
+            if let Some(scope) = &f.audience_scope
+                && scope != audience
+            {
+                return false; // scoped to a different audience (L6)
             }
             match f.class_type.as_str() {
                 "claim_kind" => f.class_value == claim_kind,
@@ -1334,12 +1760,11 @@ fn find_active_freeze(
     let rows = stmt.query_map([], map_freeze_row)?;
     for r in rows {
         let f = r?;
-        if let Some(until) = &f.frozen_until {
-            if let Ok(u) = DateTime::parse_from_rfc3339(until) {
-                if now >= u.to_utc() {
-                    continue; // lazily expired
-                }
-            }
+        if let Some(until) = &f.frozen_until
+            && let Ok(u) = DateTime::parse_from_rfc3339(until)
+            && now >= u.to_utc()
+        {
+            continue; // lazily expired
         }
         if matcher(&f) {
             return Ok(Some(f));
@@ -1416,7 +1841,10 @@ fn insert_receipt(tx: &Transaction, receipt: &Receipt) -> Result<(), StoreError>
 
 // -- assertion-lease helpers (Phase 4b) ---------------------------------
 
-fn read_assertion_snapshot(tx: &Transaction, grant_id: &str) -> Result<AssertionSnapshot, StoreError> {
+fn read_assertion_snapshot(
+    tx: &Transaction,
+    grant_id: &str,
+) -> Result<AssertionSnapshot, StoreError> {
     let mut stmt = tx.prepare(
         "SELECT state, latest_receipt_digest, actor, claim_kind, subject_scope, audience,
                 not_before, issued_at, expires_at, max_uses, spend_count
@@ -1447,7 +1875,10 @@ fn read_assertion_snapshot(tx: &Transaction, grant_id: &str) -> Result<Assertion
 /// coverage / budget predicates can run. Fail-closed (L2): an unparseable or
 /// missing `not_before`/`expires_at` is refused as `AssertionWindowIncoherent`,
 /// never silently skipped.
-fn snapshot_to_grant(snap: &AssertionSnapshot, grant_id: &str) -> Result<AssertionGrant, StoreError> {
+fn snapshot_to_grant(
+    snap: &AssertionSnapshot,
+    grant_id: &str,
+) -> Result<AssertionGrant, StoreError> {
     let parse = |o: &Option<String>| -> Result<DateTime<Utc>, StoreError> {
         o.as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -1577,6 +2008,26 @@ pub struct AssertionSpendResult {
     pub receipt: Receipt,
 }
 
+/// Result of atomically creating an entitlement-to-act grant.
+#[derive(Debug)]
+pub struct GrantCreationResult {
+    pub grant_id: Uuid,
+    pub state: GrantState,
+    pub reason: String,
+    pub final_receipt: Receipt,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Result of atomically creating and issuing an assertion lease.
+#[derive(Debug)]
+pub struct AssertionLeaseCreationResult {
+    pub grant_id: Uuid,
+    pub grant: AssertionGrant,
+    pub issued_receipt: Receipt,
+    pub genesis_digest: String,
+    pub operator_id: String,
+}
+
 /// Metadata for creating/updating a grant row.
 pub struct GrantMeta {
     /// Stable principal ID the grant is bound to
@@ -1643,6 +2094,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use standing_grant::Principal;
+    use standing_policy::{HardcodedPolicy, PolicyDecision};
     use standing_receipt::{ReceiptBuilder, ReceiptKind};
 
     const SUBJECT_ID: &str = "wl:deploy-bot:host-abc";
@@ -1680,6 +2132,161 @@ mod tests {
             issued_at: Some(Utc::now()),
             expires_at: Some(expires_at),
             not_before: None,
+        }
+    }
+
+    fn act_request(duration_secs: u64) -> GrantRequest {
+        GrantRequest {
+            subject: Principal::new(SUBJECT_ID, "deploy-bot"),
+            scope: GrantScope {
+                action: "deploy".to_string(),
+                target: "prod".to_string(),
+            },
+            duration_secs,
+            not_before: None,
+            context: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn checked_grant_creation_is_atomic_and_linear_through_policy() {
+        let mut store = Store::in_memory().unwrap();
+        let created = store
+            .create_grant(&act_request(300), &HardcodedPolicy)
+            .unwrap();
+
+        assert_eq!(created.state, GrantState::Issued);
+        let chain = store.receipt_chain(&created.grant_id.to_string()).unwrap();
+        assert_eq!(
+            chain
+                .iter()
+                .map(|receipt| receipt.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grant_requested", "policy_decision", "grant_issued"],
+        );
+        assert!(chain[0].parent_digest.is_none());
+        for pair in chain.windows(2) {
+            assert_eq!(
+                pair[1].parent_digest.as_deref(),
+                Some(pair[0].digest.as_str())
+            );
+        }
+        let row = store
+            .get_grant(&created.grant_id.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.latest_receipt_digest, created.final_receipt.digest);
+    }
+
+    #[test]
+    fn checked_grant_creation_roots_at_optional_genesis_and_records_denial() {
+        let mut store = Store::in_memory().unwrap();
+        let genesis = store
+            .install_genesis("admin:jbeck", "hardcoded:v1")
+            .unwrap();
+        let created = store
+            .create_grant(&act_request(3601), &HardcodedPolicy)
+            .unwrap();
+
+        assert_eq!(created.state, GrantState::Denied);
+        assert!(created.reason.contains("exceeds max"));
+        let chain = store.receipt_chain(&created.grant_id.to_string()).unwrap();
+        assert_eq!(
+            chain[0].parent_digest.as_deref(),
+            Some(genesis.digest.as_str())
+        );
+        assert_eq!(
+            chain[1].parent_digest.as_deref(),
+            Some(chain[0].digest.as_str())
+        );
+        assert_eq!(
+            chain[2].parent_digest.as_deref(),
+            Some(chain[1].digest.as_str())
+        );
+        assert_eq!(chain[2].kind, "grant_denied");
+    }
+
+    #[derive(Clone, Copy)]
+    enum BadPolicyMode {
+        Kind,
+        Parent,
+        Subject,
+        PolicyHash,
+        Verdict,
+    }
+
+    struct BadPolicy(BadPolicyMode);
+
+    impl PolicyEvaluator for BadPolicy {
+        fn evaluate(
+            &self,
+            _request: &GrantRequest,
+            subject: &str,
+            parent_digest: &str,
+        ) -> Result<PolicyDecision, PolicyError> {
+            let kind = match self.0 {
+                BadPolicyMode::Kind => ReceiptKind::GrantIssued,
+                BadPolicyMode::Parent
+                | BadPolicyMode::Subject
+                | BadPolicyMode::PolicyHash
+                | BadPolicyMode::Verdict => ReceiptKind::PolicyDecision,
+            };
+            let receipt_subject = match self.0 {
+                BadPolicyMode::Subject => "different-grant",
+                BadPolicyMode::Kind
+                | BadPolicyMode::Parent
+                | BadPolicyMode::PolicyHash
+                | BadPolicyMode::Verdict => subject,
+            };
+            let parent = match self.0 {
+                BadPolicyMode::Parent => "0",
+                BadPolicyMode::Kind
+                | BadPolicyMode::Subject
+                | BadPolicyMode::PolicyHash
+                | BadPolicyMode::Verdict => parent_digest,
+            };
+            let receipt_policy_hash = match self.0 {
+                BadPolicyMode::PolicyHash => "different-policy-hash",
+                _ => "bad-policy-hash",
+            };
+            let receipt_verdict = match self.0 {
+                BadPolicyMode::Verdict => "deny",
+                _ => "allow",
+            };
+            let receipt = ReceiptBuilder::new(kind, "bad-policy", receipt_subject)
+                .parent_digest(parent)
+                .policy_hash(receipt_policy_hash)
+                .evidence(serde_json::json!({"verdict": receipt_verdict}))
+                .build()?;
+            Ok(PolicyDecision {
+                verdict: Verdict::Allow,
+                reason: "malformed witness".to_string(),
+                policy_hash: self.policy_hash(),
+                receipt,
+            })
+        }
+
+        fn policy_hash(&self) -> String {
+            "bad-policy-hash".to_string()
+        }
+    }
+
+    #[test]
+    fn checked_grant_creation_rejects_malformed_policy_witnesses_without_writes() {
+        for mode in [
+            BadPolicyMode::Kind,
+            BadPolicyMode::Parent,
+            BadPolicyMode::Subject,
+            BadPolicyMode::PolicyHash,
+            BadPolicyMode::Verdict,
+        ] {
+            let mut store = Store::in_memory().unwrap();
+            assert!(
+                store
+                    .create_grant(&act_request(300), &BadPolicy(mode))
+                    .is_err()
+            );
+            assert!(store.list_grants(None).unwrap().is_empty());
         }
     }
 
@@ -1752,7 +2359,10 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, StoreError::ScopeMismatch { .. }), "got {err:?}");
+        assert!(
+            matches!(err, StoreError::ScopeMismatch { .. }),
+            "got {err:?}"
+        );
 
         // Non-consuming (D010a): the grant is unspent, so a subsequently VALID-scope
         // use still succeeds — a wrong-target presentation did not burn the grant.
@@ -1768,7 +2378,10 @@ mod tests {
                 target: "prod".to_string(),
             },
         );
-        assert!(ok.is_ok(), "grant must be unspent after a scope mismatch: {ok:?}");
+        assert!(
+            ok.is_ok(),
+            "grant must be unspent after a scope mismatch: {ok:?}"
+        );
     }
 
     #[test]
@@ -1801,7 +2414,10 @@ mod tests {
                 target: "prod".to_string(),
             },
         );
-        assert!(again.is_err(), "second spend must be refused (terminal Used)");
+        assert!(
+            again.is_err(),
+            "second spend must be refused (terminal Used)"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1851,16 +2467,28 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        let r = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap();
+        let r = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap();
         assert_eq!(r.to_state, GrantState::Active);
 
-        let r = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed,
-            &bot_subject(), serde_json::json!({"deployed": "v1.0"}), None,
-        ).unwrap();
+        let r = store
+            .transition(
+                &id,
+                GrantState::Used,
+                ReceiptKind::GrantUsed,
+                &bot_subject(),
+                serde_json::json!({"deployed": "v1.0"}),
+                None,
+            )
+            .unwrap();
         assert_eq!(r.to_state, GrantState::Used);
 
         let chain = store.receipt_chain(&id).unwrap();
@@ -1876,10 +2504,16 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        let err = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Used,
+                ReceiptKind::GrantUsed,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
 
@@ -1888,15 +2522,27 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_active_grant(future);
 
-        store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap();
+        store
+            .transition(
+                &id,
+                GrantState::Used,
+                ReceiptKind::GrantUsed,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap();
 
-        let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
 
@@ -1910,10 +2556,16 @@ mod tests {
         let past = Utc::now() - Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(past);
 
-        let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::GrantExpired(_)));
     }
 
@@ -1922,10 +2574,16 @@ mod tests {
         let past = Utc::now() - Duration::seconds(300);
         let (mut store, id) = setup_active_grant(past);
 
-        let err = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed,
-            &bot_subject(), serde_json::json!({"action": "deploy"}), None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Used,
+                ReceiptKind::GrantUsed,
+                &bot_subject(),
+                serde_json::json!({"action": "deploy"}),
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::GrantExpired(_)));
     }
 
@@ -1937,8 +2595,12 @@ mod tests {
         let (mut store, id) = setup_active_grant(just_past);
 
         let r = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed,
-            &bot_subject(), serde_json::json!({"action": "deploy"}), None,
+            &id,
+            GrantState::Used,
+            ReceiptKind::GrantUsed,
+            &bot_subject(),
+            serde_json::json!({"action": "deploy"}),
+            None,
         );
         assert!(r.is_ok(), "grant within skew grace should still be usable");
     }
@@ -1951,22 +2613,45 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let far = Utc::now() + Duration::seconds(3600);
 
-        let r1 = ReceiptBuilder::new(ReceiptKind::GrantRequested, SUBJECT_ID, &id_str).build().unwrap();
-        store.record_transition(grant_id, &GrantState::Requested, &r1, Some(meta())).unwrap();
+        let r1 = ReceiptBuilder::new(ReceiptKind::GrantRequested, SUBJECT_ID, &id_str)
+            .build()
+            .unwrap();
+        store
+            .record_transition(grant_id, &GrantState::Requested, &r1, Some(meta()))
+            .unwrap();
         let r2 = ReceiptBuilder::new(ReceiptKind::GrantIssued, SUBJECT_ID, &id_str)
-            .parent_digest(&r1.digest).build().unwrap();
+            .parent_digest(&r1.digest)
+            .build()
+            .unwrap();
         // Issued with not_before in the future.
-        store.record_transition(grant_id, &GrantState::Issued, &r2, Some(GrantMeta {
-            subject_id: SUBJECT_ID.to_string(), actor: "deploy-bot".to_string(),
-            action: "deploy".to_string(), target: "prod".to_string(),
-            issued_at: Some(Utc::now()), expires_at: Some(far), not_before: Some(future),
-        })).unwrap();
+        store
+            .record_transition(
+                grant_id,
+                &GrantState::Issued,
+                &r2,
+                Some(GrantMeta {
+                    subject_id: SUBJECT_ID.to_string(),
+                    actor: "deploy-bot".to_string(),
+                    action: "deploy".to_string(),
+                    target: "prod".to_string(),
+                    issued_at: Some(Utc::now()),
+                    expires_at: Some(far),
+                    not_before: Some(future),
+                }),
+            )
+            .unwrap();
 
         // Activation before not_before is refused.
-        let err = store.transition(
-            &id_str, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id_str,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::GrantNotYetValid(_)));
     }
 
@@ -1974,24 +2659,66 @@ mod tests {
     fn act_grant_freeze_blocks_activation_and_thaw_restores() {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
+        store
+            .install_genesis("admin:jbeck", "hardcoded:v1")
+            .unwrap();
+
+        let err = store
+            .install_freeze(
+                "inc-wrong-op",
+                "action",
+                "deploy",
+                None,
+                "not authorized",
+                None,
+                "admin:eve",
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::GenesisOperatorMismatch { .. }));
 
         // Freeze the "deploy" action class (setup grants use action=deploy).
-        store.install_freeze(
-            "inc-act", "action", "deploy", None, "deploy paused", None, "admin:jbeck", Utc::now(),
-        ).unwrap();
+        store
+            .install_freeze(
+                "inc-act",
+                "action",
+                "deploy",
+                None,
+                "deploy paused",
+                None,
+                "admin:jbeck",
+                Utc::now(),
+            )
+            .unwrap();
 
-        let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::ClassFrozen { .. }));
 
         // Thaw restores — the same grant activates, no re-issue.
-        store.thaw_freeze("inc-act", "admin:jbeck", Utc::now()).unwrap();
-        assert!(store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).is_ok());
+        store
+            .thaw_freeze("inc-act", "admin:jbeck", Utc::now())
+            .unwrap();
+        assert!(
+            store
+                .transition(
+                    &id,
+                    GrantState::Active,
+                    ReceiptKind::GrantActivated,
+                    &bot_subject(),
+                    serde_json::Value::Null,
+                    None,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1999,10 +2726,16 @@ mod tests {
         let past = Utc::now() - Duration::seconds(10);
         let (mut store, id) = setup_issued_grant(past);
 
-        let r = store.transition(
-            &id, GrantState::Expired, ReceiptKind::GrantExpired,
-            &ActorContext::system(), serde_json::Value::Null, None,
-        ).unwrap();
+        let r = store
+            .transition(
+                &id,
+                GrantState::Expired,
+                ReceiptKind::GrantExpired,
+                &ActorContext::system(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap();
         assert_eq!(r.to_state, GrantState::Expired);
     }
 
@@ -2015,15 +2748,27 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        store.transition(
-            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
-            &admin_ctx(), serde_json::json!({"reason": "security incident"}), None,
-        ).unwrap();
+        store
+            .transition(
+                &id,
+                GrantState::Revoked,
+                ReceiptKind::GrantRevoked,
+                &admin_ctx(),
+                serde_json::json!({"reason": "security incident"}),
+                None,
+            )
+            .unwrap();
 
-        let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
 
@@ -2032,15 +2777,27 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_active_grant(future);
 
-        store.transition(
-            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
-            &admin_ctx(), serde_json::json!({"reason": "policy change"}), None,
-        ).unwrap();
+        store
+            .transition(
+                &id,
+                GrantState::Revoked,
+                ReceiptKind::GrantRevoked,
+                &admin_ctx(),
+                serde_json::json!({"reason": "policy change"}),
+                None,
+            )
+            .unwrap();
 
-        let err = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Used,
+                ReceiptKind::GrantUsed,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition { .. }));
     }
 
@@ -2053,17 +2810,27 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap();
+        store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap();
 
         assert_eq!(store.get_grant(&id).unwrap().unwrap().state, "active");
 
         // Invalid adjacency: active → issued
         let err = store.transition(
-            &id, GrantState::Issued, ReceiptKind::GrantIssued,
-            &bot_subject(), serde_json::Value::Null, None,
+            &id,
+            GrantState::Issued,
+            ReceiptKind::GrantIssued,
+            &bot_subject(),
+            serde_json::Value::Null,
+            None,
         );
         assert!(err.is_err());
         assert_eq!(store.get_grant(&id).unwrap().unwrap().state, "active");
@@ -2072,10 +2839,16 @@ mod tests {
     #[test]
     fn grant_not_found_returns_error() {
         let mut store = Store::in_memory().unwrap();
-        let err = store.transition(
-            "nonexistent-id", GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                "nonexistent-id",
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::GrantNotFound(_)));
     }
 
@@ -2088,12 +2861,23 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        let stale_head = store.get_grant(&id).unwrap().unwrap().latest_receipt_digest.clone();
+        let stale_head = store
+            .get_grant(&id)
+            .unwrap()
+            .unwrap()
+            .latest_receipt_digest
+            .clone();
 
-        store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap();
+        store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap();
 
         // Manually attempt a write against the stale head
         let stale_receipt = ReceiptBuilder::new(ReceiptKind::GrantRevoked, "admin:jbeck", &id)
@@ -2124,10 +2908,16 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &wrong_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &wrong_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::Unauthorized { .. }));
     }
 
@@ -2136,10 +2926,16 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_active_grant(future);
 
-        let err = store.transition(
-            &id, GrantState::Used, ReceiptKind::GrantUsed,
-            &wrong_subject(), serde_json::json!({"action": "steal"}), None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Used,
+                ReceiptKind::GrantUsed,
+                &wrong_subject(),
+                serde_json::json!({"action": "steal"}),
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::Unauthorized { .. }));
     }
 
@@ -2148,10 +2944,16 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        let r = store.transition(
-            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
-            &admin_ctx(), serde_json::json!({"reason": "policy"}), None,
-        ).unwrap();
+        let r = store
+            .transition(
+                &id,
+                GrantState::Revoked,
+                ReceiptKind::GrantRevoked,
+                &admin_ctx(),
+                serde_json::json!({"reason": "policy"}),
+                None,
+            )
+            .unwrap();
         assert_eq!(r.to_state, GrantState::Revoked);
     }
 
@@ -2160,10 +2962,16 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        let r = store.transition(
-            &id, GrantState::Revoked, ReceiptKind::GrantRevoked,
-            &bot_subject(), serde_json::json!({"reason": "no longer needed"}), None,
-        ).unwrap();
+        let r = store
+            .transition(
+                &id,
+                GrantState::Revoked,
+                ReceiptKind::GrantRevoked,
+                &bot_subject(),
+                serde_json::json!({"reason": "no longer needed"}),
+                None,
+            )
+            .unwrap();
         assert_eq!(r.to_state, GrantState::Revoked);
     }
 
@@ -2173,11 +2981,37 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        let err = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &admin_ctx(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &admin_ctx(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn act_transition_rejects_mismatched_receipt_kind_without_advancing() {
+        let future = Utc::now() + Duration::seconds(300);
+        let (mut store, id) = setup_issued_grant(future);
+
+        let err = store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantRevoked,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ReceiptKindMismatch { .. }));
+        assert_eq!(store.get_grant(&id).unwrap().unwrap().state, "issued");
+        assert_eq!(store.receipt_chain(&id).unwrap().len(), 2);
     }
 
     #[test]
@@ -2186,10 +3020,16 @@ mod tests {
         let past = Utc::now() - Duration::seconds(10);
         let (mut store, id) = setup_issued_grant(past);
 
-        let err = store.transition(
-            &id, GrantState::Expired, ReceiptKind::GrantExpired,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap_err();
+        let err = store
+            .transition(
+                &id,
+                GrantState::Expired,
+                ReceiptKind::GrantExpired,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap_err();
         assert!(matches!(err, StoreError::Unauthorized { .. }));
     }
 
@@ -2199,8 +3039,12 @@ mod tests {
         let (mut store, id) = setup_issued_grant(future);
 
         let _ = store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &wrong_subject(), serde_json::Value::Null, None,
+            &id,
+            GrantState::Active,
+            ReceiptKind::GrantActivated,
+            &wrong_subject(),
+            serde_json::Value::Null,
+            None,
         );
 
         // State must still be issued
@@ -2212,15 +3056,20 @@ mod tests {
         let future = Utc::now() + Duration::seconds(300);
         let (mut store, id) = setup_issued_grant(future);
 
-        store.transition(
-            &id, GrantState::Active, ReceiptKind::GrantActivated,
-            &bot_subject(), serde_json::Value::Null, None,
-        ).unwrap();
+        store
+            .transition(
+                &id,
+                GrantState::Active,
+                ReceiptKind::GrantActivated,
+                &bot_subject(),
+                serde_json::Value::Null,
+                None,
+            )
+            .unwrap();
 
         let chain = store.receipt_chain(&id).unwrap();
         let activate_receipt = chain.last().unwrap();
-        let evidence: serde_json::Value =
-            serde_json::from_str(&activate_receipt.evidence).unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(&activate_receipt.evidence).unwrap();
 
         // Receipt should contain actor identity and subject binding
         assert_eq!(evidence["actor"]["principal_id"], SUBJECT_ID);
@@ -2297,6 +3146,32 @@ mod tests {
     }
 
     #[test]
+    fn assertion_issuance_binds_genesis_operator_and_distinct_actor() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(matches!(
+            store.authorize_assertion_issuance("wl:operator:laptop", "wl:speaker:host1"),
+            Err(StoreError::AssertionNoGenesis)
+        ));
+
+        store
+            .install_genesis("wl:operator:laptop", "hardcoded:v1")
+            .unwrap();
+        let genesis = store
+            .authorize_assertion_issuance("wl:operator:laptop", "wl:speaker:host1")
+            .unwrap();
+        assert_eq!(genesis.actor, "wl:operator:laptop");
+
+        assert!(matches!(
+            store.authorize_assertion_issuance("wl:impostor:laptop", "wl:speaker:host1"),
+            Err(StoreError::GenesisOperatorMismatch { .. })
+        ));
+        assert!(matches!(
+            store.authorize_assertion_issuance("wl:operator:laptop", "wl:operator:laptop"),
+            Err(StoreError::AssertionSelfGrant(_))
+        ));
+    }
+
+    #[test]
     fn policy_hash_is_deterministic_for_same_source() {
         let mut s1 = Store::in_memory().unwrap();
         let mut s2 = Store::in_memory().unwrap();
@@ -2319,8 +3194,17 @@ mod assertion_tests {
     use standing_receipt::{ReceiptBuilder, ReceiptKind};
 
     const ACTOR: &str = "component:nq:linode";
+    const OPERATOR: &str = "admin:jbeck";
 
-    fn meta(not_before: DateTime<Utc>, expires_at: Option<DateTime<Utc>>, max_uses: Option<u64>) -> AssertionGrantMeta {
+    fn install_genesis(store: &mut Store) {
+        store.install_genesis(OPERATOR, "hardcoded:v1").unwrap();
+    }
+
+    fn meta(
+        not_before: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+        max_uses: Option<u64>,
+    ) -> AssertionGrantMeta {
         AssertionGrantMeta {
             actor: ACTOR.into(),
             claim_kind: "sqlite_wal_state".into(),
@@ -2331,6 +3215,111 @@ mod assertion_tests {
             expires_at,
             max_uses,
         }
+    }
+
+    fn assertion_request(actor: &str) -> AssertionGrantRequest {
+        AssertionGrantRequest {
+            actor: Principal::new(actor, actor),
+            scope: AssertionScope {
+                claim_kind: "sqlite_wal_state".to_string(),
+                subject_scope: "labelwatch/*".to_string(),
+                audience: "nq:main".to_string(),
+            },
+            not_before: Utc::now() - Duration::minutes(1),
+            duration_secs: 3600,
+            max_uses: Some(3),
+            context: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn checked_assertion_creation_requires_genesis_operator_and_distinct_actor() {
+        let operator = Principal::new(OPERATOR, "jbeck");
+        let mut no_genesis = Store::in_memory().unwrap();
+        let err = no_genesis
+            .create_assertion_lease(&assertion_request(ACTOR), &operator)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AssertionNoGenesis));
+        assert!(
+            no_genesis
+                .list_assertion_grants(None, None)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut store = Store::in_memory().unwrap();
+        let genesis = store.install_genesis(OPERATOR, "hardcoded:v1").unwrap();
+        let impostor = Principal::new("admin:eve", "eve");
+        let err = store
+            .create_assertion_lease(&assertion_request(ACTOR), &impostor)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::GenesisOperatorMismatch { .. }));
+        let err = store
+            .create_assertion_lease(&assertion_request(OPERATOR), &operator)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AssertionSelfGrant(_)));
+        assert!(store.list_assertion_grants(None, None).unwrap().is_empty());
+
+        let created = store
+            .create_assertion_lease(&assertion_request(ACTOR), &operator)
+            .unwrap();
+        let chain = store.receipt_chain(&created.grant_id.to_string()).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].kind, "assertion_grant_requested");
+        assert_eq!(
+            chain[0].parent_digest.as_deref(),
+            Some(genesis.digest.as_str())
+        );
+        assert_eq!(chain[1].kind, "assertion_grant_issued");
+        assert_eq!(chain[1].actor, OPERATOR);
+        assert_eq!(
+            chain[1].parent_digest.as_deref(),
+            Some(chain[0].digest.as_str())
+        );
+        let row = store
+            .get_assertion_grant(&created.grant_id.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "issued");
+        assert_eq!(row.latest_receipt_digest, created.issued_receipt.digest);
+    }
+
+    #[test]
+    fn checked_assertion_creation_rolls_back_if_receipt_write_fails() {
+        let mut store = Store::in_memory().unwrap();
+        install_genesis(&mut store);
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_assertion_issue
+                 BEFORE INSERT ON receipts
+                 WHEN NEW.kind = 'assertion_grant_issued'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected receipt failure');
+                 END;",
+            )
+            .unwrap();
+
+        let before: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
+            .unwrap();
+        let err = store
+            .create_assertion_lease(
+                &assertion_request(ACTOR),
+                &Principal::new(OPERATOR, "jbeck"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)));
+        let after: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "requested receipt must roll back with issuance"
+        );
+        assert!(store.list_assertion_grants(None, None).unwrap().is_empty());
     }
 
     /// Create an Issued lease with a valid 2-receipt chain (Requested → Issued).
@@ -2347,7 +3336,12 @@ mod assertion_tests {
             .build()
             .unwrap();
         store
-            .record_assertion_transition(grant_id, &AssertionGrantState::Requested, &r1, Some(meta(not_before, None, max_uses)))
+            .record_assertion_transition(
+                grant_id,
+                &AssertionGrantState::Requested,
+                &r1,
+                Some(meta(not_before, None, max_uses)),
+            )
             .unwrap();
         let r2 = ReceiptBuilder::new(ReceiptKind::AssertionGrantIssued, ACTOR, &subject)
             .parent_digest(r1.digest.clone())
@@ -2355,7 +3349,12 @@ mod assertion_tests {
             .build()
             .unwrap();
         store
-            .record_assertion_transition(grant_id, &AssertionGrantState::Issued, &r2, Some(meta(not_before, expires_at, max_uses)))
+            .record_assertion_transition(
+                grant_id,
+                &AssertionGrantState::Issued,
+                &r2,
+                Some(meta(not_before, expires_at, max_uses)),
+            )
             .unwrap();
         grant_id
     }
@@ -2374,7 +3373,10 @@ mod assertion_tests {
     }
 
     fn wide() -> (DateTime<Utc>, Option<DateTime<Utc>>) {
-        (Utc::now() - Duration::days(1), Some(Utc::now() + Duration::days(365)))
+        (
+            Utc::now() - Duration::days(1),
+            Some(Utc::now() + Duration::days(365)),
+        )
     }
 
     #[test]
@@ -2383,13 +3385,20 @@ mod assertion_tests {
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, None);
 
-        let r1 = store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+        let r1 = store
+            .spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now())
+            .unwrap();
         assert_eq!(r1.spend_seq, 1);
         assert!(!r1.exhausted);
-        let r2 = store.spend_assertion(&proof(gid, "jti-1", "labelwatch/bar"), Utc::now()).unwrap();
+        let r2 = store
+            .spend_assertion(&proof(gid, "jti-1", "labelwatch/bar"), Utc::now())
+            .unwrap();
         assert_eq!(r2.spend_seq, 2);
 
-        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        let g = store
+            .get_assertion_grant(&gid.to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(g.state, "active");
         assert_eq!(g.spend_count, 2);
     }
@@ -2399,7 +3408,9 @@ mod assertion_tests {
         let mut store = Store::in_memory().unwrap();
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, None);
-        store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+        store
+            .spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now())
+            .unwrap();
 
         let kinds: Vec<String> = store
             .receipt_chain(&gid.to_string())
@@ -2431,8 +3442,13 @@ mod assertion_tests {
         assert!(matches!(err, Err(StoreError::AssertionOutOfScope { .. })));
 
         // ...and did not burn the budget OR the jti: the SAME jti now spends.
-        store.spend_assertion(&proof(gid, "jti-x", "labelwatch/foo"), Utc::now()).unwrap();
-        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        store
+            .spend_assertion(&proof(gid, "jti-x", "labelwatch/foo"), Utc::now())
+            .unwrap();
+        let g = store
+            .get_assertion_grant(&gid.to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(g.spend_count, 1, "refused spend must be non-consuming");
     }
 
@@ -2442,12 +3458,92 @@ mod assertion_tests {
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, None);
 
-        store.spend_assertion(&proof(gid, "jti-dup", "labelwatch/foo"), Utc::now()).unwrap();
+        store
+            .spend_assertion(&proof(gid, "jti-dup", "labelwatch/foo"), Utc::now())
+            .unwrap();
         let replay = store.spend_assertion(&proof(gid, "jti-dup", "labelwatch/foo"), Utc::now());
         assert!(matches!(replay, Err(StoreError::ReplayDetected { .. })));
 
-        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        let g = store
+            .get_assertion_grant(&gid.to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(g.spend_count, 1, "replay must not consume");
+    }
+
+    #[test]
+    fn assertion_replay_ledger_purges_past_grace_but_keeps_live_entries() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+        let now = Utc::now();
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO seen_assertion_jti (jti, audience, expires_at) VALUES (?1, ?2, ?3)",
+                params![
+                    "ancient",
+                    "nq:main",
+                    (now - Duration::hours(1)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO seen_assertion_jti (jti, audience, expires_at) VALUES (?1, ?2, ?3)",
+                params![
+                    "just-expired",
+                    "nq:main",
+                    (now - Duration::seconds(5)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO seen_assertion_jti (jti, audience, expires_at) VALUES (?1, ?2, ?3)",
+                params!["live", "nq:main", (now + Duration::hours(1)).to_rfc3339(),],
+            )
+            .unwrap();
+
+        // A successful spend commits maintenance in the same transaction.
+        store
+            .spend_assertion(&proof(gid, "trigger", "labelwatch/foo"), now)
+            .unwrap();
+        let count = |jti: &str| -> i64 {
+            store.conn.query_row(
+                "SELECT COUNT(*) FROM seen_assertion_jti WHERE jti = ?1 AND audience = 'nq:main'",
+                params![jti],
+                |row| row.get(0),
+            ).unwrap()
+        };
+        assert_eq!(count("ancient"), 0, "past-grace entry should be purged");
+        assert_eq!(
+            count("just-expired"),
+            1,
+            "skew-grace entry must remain defended"
+        );
+        assert_eq!(count("live"), 1, "unexpired entry must remain defended");
+
+        let replay = store.spend_assertion(&proof(gid, "live", "labelwatch/foo"), now);
+        assert!(matches!(replay, Err(StoreError::ReplayDetected { .. })));
+        let grace_replay =
+            store.spend_assertion(&proof(gid, "just-expired", "labelwatch/foo"), now);
+        assert!(matches!(
+            grace_replay,
+            Err(StoreError::ReplayDetected { .. })
+        ));
+        assert_eq!(
+            store
+                .get_assertion_grant(&gid.to_string())
+                .unwrap()
+                .unwrap()
+                .spend_count,
+            1,
+            "replay refusals must remain non-consuming",
+        );
     }
 
     #[test]
@@ -2487,16 +3583,26 @@ mod assertion_tests {
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, Some(2));
 
-        store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
-        let second = store.spend_assertion(&proof(gid, "jti-1", "labelwatch/foo"), Utc::now()).unwrap();
+        store
+            .spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now())
+            .unwrap();
+        let second = store
+            .spend_assertion(&proof(gid, "jti-1", "labelwatch/foo"), Utc::now())
+            .unwrap();
         assert!(second.exhausted, "the k-th spend exhausts");
 
-        let g = store.get_assertion_grant(&gid.to_string()).unwrap().unwrap();
+        let g = store
+            .get_assertion_grant(&gid.to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(g.state, "exhausted");
 
         // Further spends refuse.
         let over = store.spend_assertion(&proof(gid, "jti-2", "labelwatch/foo"), Utc::now());
-        assert!(matches!(over, Err(StoreError::AssertionBudgetExhausted { max_uses: 2 })));
+        assert!(matches!(
+            over,
+            Err(StoreError::AssertionBudgetExhausted { max_uses: 2 })
+        ));
 
         // The exhaustion receipt is in the chain.
         let kinds: Vec<String> = store
@@ -2511,7 +3617,10 @@ mod assertion_tests {
     #[test]
     fn unknown_lease_refused() {
         let mut store = Store::in_memory().unwrap();
-        let err = store.spend_assertion(&proof(Uuid::new_v4(), "jti-0", "labelwatch/foo"), Utc::now());
+        let err = store.spend_assertion(
+            &proof(Uuid::new_v4(), "jti-0", "labelwatch/foo"),
+            Utc::now(),
+        );
         assert!(matches!(err, Err(StoreError::AssertionGrantNotFound(_))));
     }
 
@@ -2526,7 +3635,9 @@ mod assertion_tests {
         let gid = issued_lease(&mut store, nb, exp, None);
         let p = proof(gid, "jti-mac", "labelwatch/foo");
         let mac = crate::sign_proof(&p, KEY).unwrap();
-        let r = store.spend_assertion_verified(&p, Some(&mac), KEY, Utc::now()).unwrap();
+        let r = store
+            .spend_assertion_verified(&p, Some(&mac), KEY, Utc::now())
+            .unwrap();
         assert_eq!(r.spend_seq, 1);
     }
 
@@ -2548,7 +3659,14 @@ mod assertion_tests {
             Err(StoreError::AssertionMacInvalid)
         ));
         // The rejected attempts did not consume the lease.
-        assert_eq!(store.get_assertion_grant(&gid.to_string()).unwrap().unwrap().spend_count, 0);
+        assert_eq!(
+            store
+                .get_assertion_grant(&gid.to_string())
+                .unwrap()
+                .unwrap()
+                .spend_count,
+            0
+        );
     }
 
     #[test]
@@ -2581,54 +3699,95 @@ mod assertion_tests {
     #[test]
     fn freeze_denies_matching_spend_thaw_restores() {
         let mut store = Store::in_memory().unwrap();
+        install_genesis(&mut store);
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, None);
 
         // Freeze the claim_kind class.
-        store.install_freeze(
-            "incident-1", "claim_kind", "sqlite_wal_state", None,
-            "storage incident", None, "admin:jbeck", Utc::now(),
-        ).unwrap();
+        store
+            .install_freeze(
+                "incident-1",
+                "claim_kind",
+                "sqlite_wal_state",
+                None,
+                "storage incident",
+                None,
+                "admin:jbeck",
+                Utc::now(),
+            )
+            .unwrap();
 
         // A covered spend is now refused with class_frozen — non-consuming.
         let err = store.spend_assertion(&proof(gid, "jf1", "labelwatch/foo"), Utc::now());
         assert!(matches!(err, Err(StoreError::ClassFrozen { .. })));
-        assert_eq!(store.get_assertion_grant(&gid.to_string()).unwrap().unwrap().spend_count, 0);
+        assert_eq!(
+            store
+                .get_assertion_grant(&gid.to_string())
+                .unwrap()
+                .unwrap()
+                .spend_count,
+            0
+        );
 
         // Thaw restores — the SAME lease spends again, no re-issue.
-        store.thaw_freeze("incident-1", "admin:jbeck", Utc::now()).unwrap();
-        let r = store.spend_assertion(&proof(gid, "jf1", "labelwatch/foo"), Utc::now()).unwrap();
+        store
+            .thaw_freeze("incident-1", "admin:jbeck", Utc::now())
+            .unwrap();
+        let r = store
+            .spend_assertion(&proof(gid, "jf1", "labelwatch/foo"), Utc::now())
+            .unwrap();
         assert_eq!(r.spend_seq, 1);
     }
 
     #[test]
     fn freeze_scoped_to_audience_does_not_screen_others() {
         let mut store = Store::in_memory().unwrap();
+        install_genesis(&mut store);
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, None); // audience nq:main
 
         // Freeze claim_kind but scoped to a DIFFERENT audience.
-        store.install_freeze(
-            "incident-2", "claim_kind", "sqlite_wal_state", Some("nq:other"),
-            "other-audience incident", None, "admin:jbeck", Utc::now(),
-        ).unwrap();
+        store
+            .install_freeze(
+                "incident-2",
+                "claim_kind",
+                "sqlite_wal_state",
+                Some("nq:other"),
+                "other-audience incident",
+                None,
+                "admin:jbeck",
+                Utc::now(),
+            )
+            .unwrap();
 
         // nq:main is unaffected (L6: scoped freeze doesn't screen B').
         let r = store.spend_assertion(&proof(gid, "jf2", "labelwatch/foo"), Utc::now());
-        assert!(r.is_ok(), "audience-scoped freeze must not screen a different audience");
+        assert!(
+            r.is_ok(),
+            "audience-scoped freeze must not screen a different audience"
+        );
     }
 
     #[test]
     fn freeze_until_lazily_expires() {
         let mut store = Store::in_memory().unwrap();
+        install_genesis(&mut store);
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, None);
 
         // Freeze that already expired (until in the past) — no longer screens.
-        store.install_freeze(
-            "incident-3", "claim_kind", "sqlite_wal_state", None,
-            "brief pause", Some(Utc::now() - Duration::seconds(10)), "admin:jbeck", Utc::now(),
-        ).unwrap();
+        store
+            .install_freeze(
+                "incident-3",
+                "claim_kind",
+                "sqlite_wal_state",
+                None,
+                "brief pause",
+                Some(Utc::now() - Duration::seconds(10)),
+                "admin:jbeck",
+                Utc::now(),
+            )
+            .unwrap();
 
         let r = store.spend_assertion(&proof(gid, "jf3", "labelwatch/foo"), Utc::now());
         assert!(r.is_ok(), "a past --until freeze should no longer match");
@@ -2639,14 +3798,233 @@ mod assertion_tests {
         let mut store = Store::in_memory().unwrap();
         let (nb, exp) = wide();
         let gid = issued_lease(&mut store, nb, exp, None);
-        store.spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now()).unwrap();
+        store
+            .spend_assertion(&proof(gid, "jti-0", "labelwatch/foo"), Utc::now())
+            .unwrap();
 
         let admin = ActorContext::admin(Principal::new("admin:jbeck", "jbeck"));
         store
-            .transition_assertion(&gid.to_string(), AssertionGrantState::Revoked, ReceiptKind::AssertionGrantRevoked, &admin, serde_json::json!({"reason":"incident"}), None, Utc::now())
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Revoked,
+                ReceiptKind::AssertionGrantRevoked,
+                &admin,
+                serde_json::json!({"reason":"incident"}),
+                None,
+                Utc::now(),
+            )
             .unwrap();
 
         let err = store.spend_assertion(&proof(gid, "jti-1", "labelwatch/foo"), Utc::now());
         assert!(err.is_err(), "cannot spend a revoked lease");
+    }
+
+    #[test]
+    fn assertion_lifecycle_enforces_roles_and_subject_binding() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+        let admin = ActorContext::admin(Principal::new(OPERATOR, "jbeck"));
+
+        let err = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Active,
+                ReceiptKind::AssertionGrantActivated,
+                &admin,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+
+        let system = ActorContext::system();
+        let err = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Active,
+                ReceiptKind::AssertionGrantActivated,
+                &system,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+
+        let wrong = ActorContext::subject(Principal::new("component:nq:other", "other"));
+        let err = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Active,
+                ReceiptKind::AssertionGrantActivated,
+                &wrong,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized { .. }));
+
+        assert_eq!(
+            store
+                .get_assertion_grant(&gid.to_string())
+                .unwrap()
+                .unwrap()
+                .state,
+            "issued"
+        );
+        assert_eq!(store.receipt_chain(&gid.to_string()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn assertion_transition_rejects_kind_mismatch_and_spend_bypass() {
+        let mut store = Store::in_memory().unwrap();
+        let (nb, exp) = wide();
+        let gid = issued_lease(&mut store, nb, exp, None);
+        let speaker = ActorContext::subject(Principal::new(ACTOR, "nq@linode"));
+
+        let err = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Active,
+                ReceiptKind::AssertionGrantRevoked,
+                &speaker,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ReceiptKindMismatch { .. }));
+        assert_eq!(store.receipt_chain(&gid.to_string()).unwrap().len(), 2);
+
+        store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Active,
+                ReceiptKind::AssertionGrantActivated,
+                &speaker,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+        let err = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Active,
+                ReceiptKind::AssertionMade,
+                &speaker,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition { .. }));
+        let lease = store
+            .get_assertion_grant(&gid.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.state, "active");
+        assert_eq!(lease.spend_count, 0);
+        assert_eq!(store.receipt_chain(&gid.to_string()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn checked_assertion_issue_requires_genesis_operator_and_distinct_speaker() {
+        fn requested_lease(store: &mut Store) -> Uuid {
+            let gid = Uuid::new_v4();
+            let receipt =
+                ReceiptBuilder::new(ReceiptKind::AssertionGrantRequested, ACTOR, gid.to_string())
+                    .build()
+                    .unwrap();
+            store
+                .record_assertion_transition(
+                    gid,
+                    &AssertionGrantState::Requested,
+                    &receipt,
+                    Some(meta(Utc::now(), None, Some(1))),
+                )
+                .unwrap();
+            gid
+        }
+
+        let mut store = Store::in_memory().unwrap();
+        let gid = requested_lease(&mut store);
+        let operator = ActorContext::admin(Principal::new(OPERATOR, "jbeck"));
+        let err = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Issued,
+                ReceiptKind::AssertionGrantIssued,
+                &operator,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::GenesisRequired { .. }));
+
+        install_genesis(&mut store);
+        let impostor = ActorContext::admin(Principal::new("admin:eve", "eve"));
+        let err = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Issued,
+                ReceiptKind::AssertionGrantIssued,
+                &impostor,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::GenesisOperatorMismatch { .. }));
+
+        let receipt = store
+            .transition_assertion(
+                &gid.to_string(),
+                AssertionGrantState::Issued,
+                ReceiptKind::AssertionGrantIssued,
+                &operator,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(receipt.actor, OPERATOR);
+        assert_eq!(receipt.evidence["actor"]["principal_id"], OPERATOR);
+
+        let mut self_store = Store::in_memory().unwrap();
+        self_store.install_genesis(ACTOR, "hardcoded:v1").unwrap();
+        let self_gid = requested_lease(&mut self_store);
+        let self_admin = ActorContext::admin(Principal::new(ACTOR, "nq@linode"));
+        let err = self_store
+            .transition_assertion(
+                &self_gid.to_string(),
+                AssertionGrantState::Issued,
+                ReceiptKind::AssertionGrantIssued,
+                &self_admin,
+                serde_json::Value::Null,
+                None,
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AssertionSelfGrant(_)));
+        assert_eq!(
+            self_store
+                .get_assertion_grant(&self_gid.to_string())
+                .unwrap()
+                .unwrap()
+                .state,
+            "requested"
+        );
+        assert_eq!(
+            self_store
+                .receipt_chain(&self_gid.to_string())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

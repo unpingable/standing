@@ -1,3 +1,4 @@
+use crate::assertion::AssertionGrantState;
 use crate::lifecycle::GrantState;
 use crate::principal::PrincipalRole;
 
@@ -75,20 +76,107 @@ const AUTH_MATRIX: &[AuthEntry] = &[
     },
 ];
 
+/// Authorization matrix entry for assertion-lease lifecycle transitions.
+///
+/// Assertion spends use the `Active -> Active` edge through the dedicated
+/// store spend path, but the edge still belongs here so the role rule has one
+/// canonical home.
+struct AssertionAuthEntry {
+    from: AssertionGrantState,
+    to: AssertionGrantState,
+    allowed_roles: &'static [PrincipalRole],
+}
+
+const ASSERTION_AUTH_MATRIX: &[AssertionAuthEntry] = &[
+    // Requested -> Issued/Denied: an administrator decides the request.
+    AssertionAuthEntry {
+        from: AssertionGrantState::Requested,
+        to: AssertionGrantState::Issued,
+        allowed_roles: &[PrincipalRole::Admin],
+    },
+    AssertionAuthEntry {
+        from: AssertionGrantState::Requested,
+        to: AssertionGrantState::Denied,
+        allowed_roles: &[PrincipalRole::Admin],
+    },
+    // Issued -> Active and Active -> Active: the bound speaker only.
+    AssertionAuthEntry {
+        from: AssertionGrantState::Issued,
+        to: AssertionGrantState::Active,
+        allowed_roles: &[PrincipalRole::Subject],
+    },
+    AssertionAuthEntry {
+        from: AssertionGrantState::Active,
+        to: AssertionGrantState::Active,
+        allowed_roles: &[PrincipalRole::Subject],
+    },
+    // Explicit revocation may be administrative or a self-revocation.
+    AssertionAuthEntry {
+        from: AssertionGrantState::Issued,
+        to: AssertionGrantState::Revoked,
+        allowed_roles: &[PrincipalRole::Admin, PrincipalRole::Subject],
+    },
+    AssertionAuthEntry {
+        from: AssertionGrantState::Active,
+        to: AssertionGrantState::Revoked,
+        allowed_roles: &[PrincipalRole::Admin, PrincipalRole::Subject],
+    },
+    // Clock- and budget-driven terminal transitions are system-owned.
+    AssertionAuthEntry {
+        from: AssertionGrantState::Issued,
+        to: AssertionGrantState::Expired,
+        allowed_roles: &[PrincipalRole::System],
+    },
+    AssertionAuthEntry {
+        from: AssertionGrantState::Active,
+        to: AssertionGrantState::Expired,
+        allowed_roles: &[PrincipalRole::System],
+    },
+    AssertionAuthEntry {
+        from: AssertionGrantState::Active,
+        to: AssertionGrantState::Exhausted,
+        allowed_roles: &[PrincipalRole::System],
+    },
+];
+
 /// Check if the given role is authorized to perform the transition.
 ///
 /// Returns true if the (from, to, role) triple is in the auth matrix.
 /// Returns false otherwise — fail closed.
 pub fn is_authorized(from: &GrantState, to: &GrantState, role: PrincipalRole) -> bool {
-    AUTH_MATRIX.iter().any(|entry| {
-        &entry.from == from && &entry.to == to && entry.allowed_roles.contains(&role)
-    })
+    AUTH_MATRIX
+        .iter()
+        .any(|entry| &entry.from == from && &entry.to == to && entry.allowed_roles.contains(&role))
 }
 
 /// Returns the allowed roles for a given transition, or empty if the
 /// transition itself is not in the matrix.
 pub fn allowed_roles(from: &GrantState, to: &GrantState) -> Vec<PrincipalRole> {
     AUTH_MATRIX
+        .iter()
+        .filter(|entry| &entry.from == from && &entry.to == to)
+        .flat_map(|entry| entry.allowed_roles.iter().copied())
+        .collect()
+}
+
+/// Check whether a role may perform an assertion-lease transition.
+/// Unknown triples fail closed.
+pub fn is_assertion_authorized(
+    from: &AssertionGrantState,
+    to: &AssertionGrantState,
+    role: PrincipalRole,
+) -> bool {
+    ASSERTION_AUTH_MATRIX
+        .iter()
+        .any(|entry| &entry.from == from && &entry.to == to && entry.allowed_roles.contains(&role))
+}
+
+/// Return the roles admitted for an assertion-lease transition.
+pub fn allowed_assertion_roles(
+    from: &AssertionGrantState,
+    to: &AssertionGrantState,
+) -> Vec<PrincipalRole> {
+    ASSERTION_AUTH_MATRIX
         .iter()
         .filter(|entry| &entry.from == from && &entry.to == to)
         .flat_map(|entry| entry.allowed_roles.iter().copied())
@@ -200,6 +288,64 @@ mod tests {
                 assert!(
                     !roles.is_empty(),
                     "transition {:?} → {:?} has no authorized roles",
+                    from,
+                    to,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assertion_subject_can_activate_and_spend_but_not_issue() {
+        assert!(is_assertion_authorized(
+            &AssertionGrantState::Issued,
+            &AssertionGrantState::Active,
+            PrincipalRole::Subject,
+        ));
+        assert!(is_assertion_authorized(
+            &AssertionGrantState::Active,
+            &AssertionGrantState::Active,
+            PrincipalRole::Subject,
+        ));
+        assert!(!is_assertion_authorized(
+            &AssertionGrantState::Requested,
+            &AssertionGrantState::Issued,
+            PrincipalRole::Subject,
+        ));
+    }
+
+    #[test]
+    fn assertion_admin_can_issue_and_revoke_but_not_activate() {
+        assert!(is_assertion_authorized(
+            &AssertionGrantState::Requested,
+            &AssertionGrantState::Issued,
+            PrincipalRole::Admin,
+        ));
+        assert!(is_assertion_authorized(
+            &AssertionGrantState::Active,
+            &AssertionGrantState::Revoked,
+            PrincipalRole::Admin,
+        ));
+        assert!(!is_assertion_authorized(
+            &AssertionGrantState::Issued,
+            &AssertionGrantState::Active,
+            PrincipalRole::Admin,
+        ));
+    }
+
+    #[test]
+    fn all_assertion_adjacencies_have_auth_entries() {
+        let states = [
+            AssertionGrantState::Requested,
+            AssertionGrantState::Issued,
+            AssertionGrantState::Active,
+        ];
+        for from in &states {
+            for to in from.allowed_transitions() {
+                let roles = allowed_assertion_roles(from, to);
+                assert!(
+                    !roles.is_empty(),
+                    "assertion transition {:?} -> {:?} has no authorized roles",
                     from,
                     to,
                 );

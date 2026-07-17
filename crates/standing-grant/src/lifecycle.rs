@@ -71,19 +71,22 @@ impl GrantState {
     pub fn can_transition_to(&self, target: &GrantState) -> bool {
         self.allowed_transitions().contains(target)
     }
+}
 
-    /// Parse from the string form used in storage.
-    pub fn from_str(s: &str) -> Option<GrantState> {
+impl std::str::FromStr for GrantState {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "requested" => Some(GrantState::Requested),
-            "issued" => Some(GrantState::Issued),
-            "active" => Some(GrantState::Active),
-            "used" => Some(GrantState::Used),
-            "expired" => Some(GrantState::Expired),
-            "revoked" => Some(GrantState::Revoked),
-            "denied" => Some(GrantState::Denied),
-            "abandoned" => Some(GrantState::Abandoned),
-            _ => None,
+            "requested" => Ok(GrantState::Requested),
+            "issued" => Ok(GrantState::Issued),
+            "active" => Ok(GrantState::Active),
+            "used" => Ok(GrantState::Used),
+            "expired" => Ok(GrantState::Expired),
+            "revoked" => Ok(GrantState::Revoked),
+            "denied" => Ok(GrantState::Denied),
+            "abandoned" => Ok(GrantState::Abandoned),
+            _ => Err(()),
         }
     }
 }
@@ -120,21 +123,26 @@ impl GrantMachine {
     /// walk terminates AT the named operator-fiat root rather than beside it.
     /// `None` leaves the chain unrooted (pre-genesis instances / act-grants
     /// created before a genesis was installed).
-    pub fn request_rooted(req: &GrantRequest, genesis_digest: Option<&str>) -> Result<Self, GrantError> {
+    pub fn request_rooted(
+        req: &GrantRequest,
+        genesis_digest: Option<&str>,
+    ) -> Result<Self, GrantError> {
         let grant_id = Uuid::new_v4();
         let subject = grant_id.to_string();
 
-        let mut builder = ReceiptBuilder::new(ReceiptKind::GrantRequested, &req.subject.id, &subject)
-            .evidence(serde_json::json!({
-                "subject": req.subject,
-                "scope": {
-                    "action": req.scope.action,
-                    "target": req.scope.target,
-                },
-                "duration_secs": req.duration_secs,
-                "not_before": req.not_before.map(|t| t.to_rfc3339()),
-                "context": req.context,
-            }));
+        let mut builder =
+            ReceiptBuilder::new(ReceiptKind::GrantRequested, &req.subject.id, &subject).evidence(
+                serde_json::json!({
+                    "subject": req.subject,
+                    "scope": {
+                        "action": req.scope.action,
+                        "target": req.scope.target,
+                    },
+                    "duration_secs": req.duration_secs,
+                    "not_before": req.not_before.map(|t| t.to_rfc3339()),
+                    "context": req.context,
+                }),
+            );
         if let Some(g) = genesis_digest {
             builder = builder.parent_digest(g);
         }
@@ -377,11 +385,12 @@ impl GrantMachine {
 
     fn check_not_expired(&self) -> Result<(), GrantError> {
         if let Some(grant) = &self.grant
-            && grant.is_expired_at(Utc::now()) {
-                return Err(GrantError::Expired {
-                    expired_at: grant.expires_at.to_rfc3339(),
-                });
-            }
+            && grant.is_expired_at(Utc::now())
+        {
+            return Err(GrantError::Expired {
+                expired_at: grant.expires_at.to_rfc3339(),
+            });
+        }
         Ok(())
     }
 }
@@ -413,8 +422,12 @@ mod tests {
         assert_eq!(m.state, GrantState::Requested);
         assert_eq!(m.chain.len(), 1);
 
-        m.issue(300, "policy-sha256-abc", serde_json::json!({"allowed": true}))
-            .unwrap();
+        m.issue(
+            300,
+            "policy-sha256-abc",
+            serde_json::json!({"allowed": true}),
+        )
+        .unwrap();
         assert_eq!(m.state, GrantState::Issued);
         assert_eq!(m.chain.len(), 2);
 
@@ -436,15 +449,16 @@ mod tests {
         let req = test_request();
         let mut m = GrantMachine::request(&req).unwrap();
 
-        m.deny("policy-sha256-abc", serde_json::json!({"reason": "scope too broad"}))
-            .unwrap();
+        m.deny(
+            "policy-sha256-abc",
+            serde_json::json!({"reason": "scope too broad"}),
+        )
+        .unwrap();
         assert_eq!(m.state, GrantState::Denied);
         assert!(m.state.is_terminal());
 
         // Can't issue after deny
-        assert!(m
-            .issue(300, "x", serde_json::json!(null))
-            .is_err());
+        assert!(m.issue(300, "x", serde_json::json!(null)).is_err());
     }
 
     #[test]

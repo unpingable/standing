@@ -1,20 +1,16 @@
 # Lifecycle freeze — incident-mode suspension
 
-> **Status:** `implemented` (Wave 3). `standing policy freeze | thaw |
-> list-freezes` exist; a `policy_freezes` table holds the deny-overlay; freeze
-> and thaw are receipt-bearing (`ReceiptKind::PolicyFrozen` / `PolicyThawed`);
-> matching assertion spends are refused with `standing_basis:
-> class_frozen:<handle>`. `--until` is a lazy deny-overlay predicate (a past
-> `until` simply stops matching — no scheduler, no auto-thaw). Freezes are
-> audience-scopable and a scoped freeze does not screen other audiences. Frozen
-> leases keep counting clock-time toward expiry (deny-overlay, not stop-clock).
-> **Pinned on build:** auth is operator identity (fiat under the genesis chain);
-> freeze applies to the assertion-lease path — act-grant freeze integration is a
-> follow-on.
+> **Status:** Implemented in Phase 4b–6. `standing policy freeze | thaw |
+> list-freezes` manage a receipt-bearing deny-overlay in `policy_freezes`.
+> Matching assertion spends and authorizing act-grant transitions are refused;
+> assertion decisions surface `class_frozen:<handle>`. `--until` is lazy expiry:
+> after the timestamp the row stops matching, with no scheduler or synthetic
+> thaw receipt. Frozen grants keep counting clock time. Freeze and thaw require
+> a verified identity matching the installed genesis operator.
 >
 > **Composes with:** `docs/remote-standing-boundary.md`, slice-1 grant state machine, README "Invariants" block.
 
-## The gap
+## The gap (historical, now closed)
 
 The slice-1 grant state machine has terminal and time-bound transitions:
 
@@ -24,11 +20,13 @@ Issued    → Active | Expired | Revoked | Abandoned
 Active    → Used (event) | Expired | Revoked | Abandoned | LeaseExpired
 ```
 
-What is missing is a **non-terminal, ops-driven suspension** — a verb that means:
+What was missing was a **non-terminal, ops-driven suspension** — a verb that
+means:
 
 > This grant class remains real, but cannot authorise while incident mode is active.
 
-Today the operator's only options for "halt deploys while smoke is coming out of the machine" are:
+Before the freeze overlay, the operator's only options for "halt deploys while
+smoke is coming out of the machine" were:
 
 1. **Revoke individual grants.** Wrong tool: revocation is terminal, requires re-issuing each grant after the incident closes, and abuses a security-shaped verb for an ops-shaped condition.
 2. **Mutate policy.** Heavy: policy-hash flips on every freeze/thaw, the receipt chain inflates with policy churn, and the operator has to author and unauthor counter-policy entries.
@@ -36,21 +34,30 @@ Today the operator's only options for "halt deploys while smoke is coming out of
 
 None of those match the actual ops reality, which is not *"Bob's grant is bad"* but *"nobody deploys until the smoke stops."*
 
-## The verb (candidate)
+## Current CLI
 
-```text
+```bash
 standing policy freeze \
-  --class <claim_kind | action | actor pattern> \
-  --reason <free-text incident handle> \
+  --handle <incident-handle> \
+  --class-type <claim_kind | action | actor | audience> \
+  --class-value <exact-value> \
+  --reason <free-text-reason> \
   [--audience <name:instance>] \
-  [--until <RFC 3339 timestamp>]
+  [--until <RFC-3339-timestamp>] \
+  --identity <genesis-operator-identity> --secret <key>
 
-standing policy thaw --class <...> [--audience <...>]
+standing policy thaw --handle <incident-handle> \
+  --identity <genesis-operator-identity> --secret <key>
 
-standing policy list-freezes
+standing policy list-freezes [--all]
 ```
 
 `freeze` is **policy-level, not per-grant.** A freeze entry is a row in a policy-side table; matching grants continue to exist with their current state, but resolvers refuse them with a named refusal mode while the freeze covers them.
+
+`claim_kind` and `audience` target assertion leases. `action` targets act
+grants. `actor` can screen either path. Optional `--audience` narrows an
+assertion `claim_kind` or `actor` freeze to one audience; audience-scoped rows
+do not apply to act grants, which carry no audience.
 
 ## The lifecycle ladder, restated
 
@@ -74,18 +81,20 @@ class_frozen        a policy-level freeze covers this request;
                     handle surface in standing_basis.
 ```
 
-The freeze becomes visible in receipts:
+The resolver decision gives a consumer enough information to make the refusal
+visible in its own receipt:
 
 ```json
 {
   "standing_verdict": "denied",
   "standing_basis": "class_frozen:incident-2026-06-10-deploy-rollback",
-  "freeze_class": "claim_kind:deploy",
-  "freeze_reason": "incident mode — deploy paused pending storage01 recovery",
-  "freeze_until": "2026-06-10T18:00:00Z",
+  "reason": "assertion refused: class frozen ...",
   ...
 }
 ```
+
+The separately stored `PolicyFrozen` receipt carries `class_type`,
+`class_value`, audience scope, reason, and optional `frozen_until`.
 
 ## Properties this spec must obey
 
@@ -97,10 +106,10 @@ Non-terminal at the grant layer.
   the grant; it screens it.
 
 Receipt-bearing.
-  Both freeze and thaw emit policy-event receipts. The receipt
-  chain for any denied-during-freeze request walks back through
-  the policy-freeze receipt, not through a grant-revocation
-  receipt that does not exist.
+  Both explicit freeze and explicit thaw emit policy-event
+  receipts. A denied request names the freeze handle, which makes
+  that policy receipt citable; the refusal does not fabricate a
+  grant transition or append to the untouched grant's chain.
 
 Scoped by class, not by holder.
   Freeze targets a claim_kind, an action, an actor pattern, an
@@ -110,16 +119,16 @@ Scoped by class, not by holder.
 
 Reversible by default.
   No --until means the freeze is open-ended until explicit thaw.
-  --until adds an automatic thaw event scheduled at the timestamp;
-  the auto-thaw still emits a receipt.
+  --until is lazy expiry: after the timestamp the entry no longer
+  matches. There is no scheduler and no automatic thaw receipt.
 
 Visible in receipts immediately.
-  A request denied during a freeze MUST surface the freeze handle
-  in standing_basis. An operator reading why must reach the
-  freeze receipt, not a generic deny.
+  A resolver decision denied during a freeze surfaces the handle
+  in standing_basis. Consumers record that decision; operators
+  can cite the independently stored PolicyFrozen receipt.
 ```
 
-## What the forcing event looks like
+## Historical forcing event (satisfied)
 
 The candidate becomes binding when one of the following happens:
 
@@ -127,19 +136,27 @@ The candidate becomes binding when one of the following happens:
 2. A consumer (NQ binding flip, Wicket adapter, AG) requests a `freeze` verb to wire into its own incident-mode handling.
 3. An ops handbook for any Standing-consuming system references "freeze the deploy class while we investigate" as a step and the step lands on this spec.
 
-Until then: candidate-not-binding. No code today. No policy table schema today. No CLI subcommand today.
+The Phase 4b–6 hardening pass promoted the candidate and implemented the table,
+CLI, receipts, and enforcement on both grant families.
 
-## What this does not specify
+## Current boundaries
 
-- Authorization for `freeze` and `thaw` themselves. Probably: requires a grant authorising policy mutation, or operator fiat under the genesis chain (see [[genesis-receipt]]). Pinned when the spec is built.
-- Interaction with the post-MVP `AssertionGrant` lease shape. A frozen lease should probably continue to count clock-time toward expiry rather than being "paused" — that is, freeze is not a stop-clock, it is a deny-overlay. Worth pinning when Phase 4 builds.
+- Freeze/thaw authority is the verified genesis operator. No arbitrary verified
+  workload may mutate the overlay.
+- Assertion and act-grant enforcement is implemented. A freeze is not a
+  stop-clock and never rewrites grant state.
 - Cross-instance freeze propagation (no federation, so: not in scope).
-- Conflict with consumer-side `standing_visible_not_binding` mode. The freeze should be visible in the decision regardless; whether the consumer acts on it is the consumer's call, same shape as the rest of visible-not-binding.
+- In `visible_not_binding` mode the decision remains advisory; a consumer must
+  record the freeze posture but chooses whether it binds. Binding mode refuses.
 
-## Why now (paper, not code)
+## Historical rationale
 
 Freeze is the missing ops verb that the slice-1 lifecycle did not invent because slice-1 closed shipping entitlement-to-act for a single co-located deployment. Cross-machine deployment turns ops drills into a real shape — incident mode is the use case that distinguishes "this individual grant is bad" from "this class of operation is paused." Naming the verb now lets the next consumer that asks for it find the shape pre-cooked rather than inventing a per-consumer kill-switch and re-discovering the revocation-abuse pattern.
 
 ## Provenance
 
-Filed 2026-06-10 from a review pass on Standing's lifecycle. The verb was named in a follow-up: *"Freeze means: this grant class remains real, but cannot authorize while incident mode is active. Policy-level makes sense. ... It avoids abusing revocation for temporary suspension."* The ladder `mint → active → frozen → active` with `↘ revoked / expired` is the explicit lifecycle shape that motivates the policy-layer placement. No code today; candidate spec only.
+Filed 2026-06-10 from a review pass on Standing's lifecycle. The verb was named
+in a follow-up: *"Freeze means: this grant class remains real, but cannot
+authorize while incident mode is active. Policy-level makes sense. ... It
+avoids abusing revocation for temporary suspension."* The candidate text is
+retained as design stratigraphy; implementation landed in Phase 4b–6.

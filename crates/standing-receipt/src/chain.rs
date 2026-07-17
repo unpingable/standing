@@ -31,6 +31,13 @@ impl ReceiptChain {
     pub fn append(&mut self, receipt: Receipt) -> Result<(), ReceiptError> {
         let tip = self.tip();
 
+        if receipt.subject != self.subject {
+            return Err(ReceiptError::SubjectMismatch {
+                expected: self.subject.clone(),
+                actual: receipt.subject.clone(),
+            });
+        }
+
         // Verify chain linkage
         match &receipt.parent_digest {
             Some(parent) if parent == &tip.digest => {}
@@ -77,6 +84,14 @@ impl ReceiptChain {
         self.receipts.len()
     }
 
+    /// Whether the chain contains no receipts.
+    ///
+    /// A normally constructed chain is never empty, but exposing this alongside
+    /// [`ReceiptChain::len`] keeps the collection-style API complete.
+    pub fn is_empty(&self) -> bool {
+        self.receipts.is_empty()
+    }
+
     /// Verify the entire chain's integrity: every receipt re-hashes to its
     /// stored digest under a known schema version, and each receipt's
     /// parent_digest matches the previous receipt's digest.
@@ -89,6 +104,12 @@ impl ReceiptChain {
         for window in self.receipts.windows(2) {
             let prev = &window[0];
             let curr = &window[1];
+            if curr.subject != self.subject {
+                return Err(ReceiptError::SubjectMismatch {
+                    expected: self.subject.clone(),
+                    actual: curr.subject.clone(),
+                });
+            }
             match &curr.parent_digest {
                 Some(parent) if parent == &prev.digest => {}
                 Some(parent) => {
@@ -171,5 +192,20 @@ mod tests {
             .unwrap();
 
         assert!(chain.append(bad).is_err());
+    }
+
+    #[test]
+    fn different_subject_rejected() {
+        let r1 = ReceiptBuilder::new(ReceiptKind::GrantRequested, "bot", "g1")
+            .build()
+            .unwrap();
+        let mut chain = ReceiptChain::new(r1);
+        let bad = ReceiptBuilder::new(ReceiptKind::GrantIssued, "bot", "g2")
+            .parent_digest(chain.tip().digest.clone())
+            .build()
+            .unwrap();
+
+        let err = chain.append(bad).unwrap_err();
+        assert!(matches!(err, ReceiptError::SubjectMismatch { .. }));
     }
 }

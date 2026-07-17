@@ -12,12 +12,12 @@ mod lifecycle;
 pub mod principal;
 
 pub use assertion::{
-    assertion_covers, subject_scope_matches, AssertCoverage, AssertionGrant,
-    AssertionGrantRequest, AssertionGrantState, AssertionScope, RequestProof, WindowState,
-    ASSERTION_MADE_VERSION, PROOF_VERSION,
+    ASSERTION_MADE_VERSION, AssertCoverage, AssertionGrant, AssertionGrantRequest,
+    AssertionGrantState, AssertionScope, PROOF_VERSION, RequestProof, WindowState,
+    assertion_covers, subject_scope_matches,
 };
 pub use assertion_lifecycle::AssertionGrantMachine;
 pub use error::GrantError;
 pub use grant::{Grant, GrantRequest, GrantScope};
-pub use lifecycle::{GrantState, GrantMachine};
+pub use lifecycle::{GrantMachine, GrantState};
 pub use principal::{ActorContext, Principal, PrincipalRole};

@@ -84,18 +84,21 @@ impl AssertionGrantState {
     pub fn can_transition_to(&self, target: &AssertionGrantState) -> bool {
         self.allowed_transitions().contains(target)
     }
+}
 
-    /// Parse from the string form used in storage.
-    pub fn from_str(s: &str) -> Option<AssertionGrantState> {
+impl std::str::FromStr for AssertionGrantState {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "requested" => Some(AssertionGrantState::Requested),
-            "issued" => Some(AssertionGrantState::Issued),
-            "active" => Some(AssertionGrantState::Active),
-            "expired" => Some(AssertionGrantState::Expired),
-            "revoked" => Some(AssertionGrantState::Revoked),
-            "denied" => Some(AssertionGrantState::Denied),
-            "exhausted" => Some(AssertionGrantState::Exhausted),
-            _ => None,
+            "requested" => Ok(AssertionGrantState::Requested),
+            "issued" => Ok(AssertionGrantState::Issued),
+            "active" => Ok(AssertionGrantState::Active),
+            "expired" => Ok(AssertionGrantState::Expired),
+            "revoked" => Ok(AssertionGrantState::Revoked),
+            "denied" => Ok(AssertionGrantState::Denied),
+            "exhausted" => Ok(AssertionGrantState::Exhausted),
+            _ => Err(()),
         }
     }
 }
@@ -323,7 +326,12 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().to_utc()
     }
 
-    fn lease(not_before: &str, expires_at: &str, max_uses: Option<u64>, spend_count: u64) -> AssertionGrant {
+    fn lease(
+        not_before: &str,
+        expires_at: &str,
+        max_uses: Option<u64>,
+        spend_count: u64,
+    ) -> AssertionGrant {
         AssertionGrant {
             id: Uuid::new_v4(),
             actor: Principal::new("component:nq:linode", "nq@linode"),
@@ -376,7 +384,7 @@ mod tests {
             AssertionGrantState::Denied,
             AssertionGrantState::Exhausted,
         ] {
-            assert_eq!(AssertionGrantState::from_str(&s.to_string()), Some(s));
+            assert_eq!(s.to_string().parse::<AssertionGrantState>(), Ok(s));
         }
     }
 
@@ -386,12 +394,24 @@ mod tests {
     fn window_within_and_edges() {
         let g = lease("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 0);
         let z = Duration::zero();
-        assert_eq!(g.window_state(t("2026-01-01T12:00:00Z"), z), WindowState::Within);
+        assert_eq!(
+            g.window_state(t("2026-01-01T12:00:00Z"), z),
+            WindowState::Within
+        );
         // Inclusive upper bound: valid AT expiry.
-        assert_eq!(g.window_state(t("2026-01-02T00:00:00Z"), z), WindowState::Within);
+        assert_eq!(
+            g.window_state(t("2026-01-02T00:00:00Z"), z),
+            WindowState::Within
+        );
         // Strictly after expiry: expired.
-        assert_eq!(g.window_state(t("2026-01-02T00:00:01Z"), z), WindowState::Expired);
-        assert_eq!(g.window_state(t("2025-12-31T23:59:59Z"), z), WindowState::NotYetValid);
+        assert_eq!(
+            g.window_state(t("2026-01-02T00:00:01Z"), z),
+            WindowState::Expired
+        );
+        assert_eq!(
+            g.window_state(t("2025-12-31T23:59:59Z"), z),
+            WindowState::NotYetValid
+        );
     }
 
     #[test]
@@ -409,9 +429,15 @@ mod tests {
         let g = lease("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 0);
         let skew = Duration::seconds(30);
         // 20s before not_before, within skew grace → Within.
-        assert_eq!(g.window_state(t("2025-12-31T23:59:40Z"), skew), WindowState::Within);
+        assert_eq!(
+            g.window_state(t("2025-12-31T23:59:40Z"), skew),
+            WindowState::Within
+        );
         // 20s after expiry, within skew grace → Within.
-        assert_eq!(g.window_state(t("2026-01-02T00:00:20Z"), skew), WindowState::Within);
+        assert_eq!(
+            g.window_state(t("2026-01-02T00:00:20Z"), skew),
+            WindowState::Within
+        );
     }
 
     // -- budget (L1) -----------------------------------------------------
@@ -432,7 +458,12 @@ mod tests {
 
     #[test]
     fn unbounded_lease_never_exhausts() {
-        let g = lease("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 1_000_000);
+        let g = lease(
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            None,
+            1_000_000,
+        );
         assert!(!g.is_exhausted());
         assert_eq!(g.budget_remaining(), None);
     }

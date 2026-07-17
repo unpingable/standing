@@ -10,11 +10,11 @@
 //! No signatures yet — hash is mandatory, signatures are future work.
 
 mod canonical;
+mod chain;
 mod error;
 mod receipt;
-mod chain;
 
 pub use canonical::canonical_json;
+pub use chain::ReceiptChain;
 pub use error::ReceiptError;
 pub use receipt::{Receipt, ReceiptBuilder, ReceiptKind, SCHEMA_VERSION};
-pub use chain::ReceiptChain;

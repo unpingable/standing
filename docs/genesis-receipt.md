@@ -1,20 +1,34 @@
 # Genesis receipt #0
 
-> **Status:** MVP landed 2026-06-10. The CLI surface (`standing genesis install` / `standing genesis show`) and the `ReceiptKind::GenesisInstall` variant exist and are tested. `standing query why` now footers the genesis as the named chain root, or notes the silence and instructs how to install one. **Deferred:** cryptographic parent-linkage of grant receipts to genesis (today the genesis is a side-by-side root visible in `query why`, not a re-chained ancestor of each grant's first receipt). That step waits for a forcing case.
+> **Status:** Implemented. `standing genesis install/show` and
+> `ReceiptKind::GenesisInstall` exist; the store permits exactly one genesis
+> receipt. Act-grant chains created after installation and all assertion-lease
+> chains are cryptographically rooted by making their first receipt's
+> `parent_digest` the genesis digest. Assertion issuance fails closed without
+> that settlement witness. `query why` and `query chain` report the root.
+> Pre-genesis historical act grants are not retroactively re-parented.
+> Assertion issuance and freeze/thaw additionally require a verified operator
+> matching the genesis actor; an assertion lease is issued to a distinct
+> speaker, never self-granted by that speaker.
 >
 > **Composes with:** README "Invariants" block (state-not-cargo), `docs/remote-standing-boundary.md`, `project_standing_design_decisions` (fail-closed on receipts).
 
-## The gap
+## The gap (historical, now closed)
 
-`standing query why --id <grant-id>` walks the receipt chain backward from current state, citing the policy decision that authorised activation, terminating at the grant request receipt. The walk currently terminates **in silence further back** — there is no receipt that names the operator who established the initial policy, on what date, under what authority.
+Before genesis support, `standing query why --id <grant-id>` walked backward to
+the grant request and then terminated in silence. There was no receipt naming
+the operator who established initial authority. That was the gap this filing
+identified; current post-genesis chains terminate at the citable root.
 
 A chain that terminates at silence is fiat laundered through omission. A chain that terminates at a named genesis receipt is fiat made citable.
 
 > Standing's invariant is *fail-closed on receipts*. The genesis of the receipt chain itself should obey the invariant.
 
-## The spec (candidate)
+## Historical candidate shape
 
-A new receipt kind, emitted exactly once per Standing instance at the point of first policy install:
+The proposal used the following conceptual shape. The implementation stores
+these fields through the normal `Receipt` envelope plus its evidence object;
+this block is explanatory, not a byte-for-byte wire example:
 
 ```json
 {
@@ -56,14 +70,18 @@ Fiat is named, not avoided.
   fiat visible. Standing does not magic up institutional authority
   it does not have.
 
-policy_hash pins the policy.
+policy_hash pins the policy source present at genesis.
   Subsequent policy updates are themselves receipt-bearing events
   authorised under prior grants OR (for the operator) under
   citation of the GenesisInstall receipt. The instance never
   forgets where it started.
 ```
 
-## What the forcing event looks like
+The first four properties are implemented. The final paragraph's general
+policy-update lifecycle remains doctrine; Standing currently has genesis and
+freeze/thaw policy events, not an arbitrary policy-install/update subsystem.
+
+## Historical forcing event (satisfied)
 
 The candidate becomes binding when one of the following happens:
 
@@ -71,7 +89,10 @@ The candidate becomes binding when one of the following happens:
 2. Standing acquires a second consumer (NQ goes binding, or AG arrives) and that consumer asks "what authorised the *policy*?" — at which point the answer "nothing, it's just there" is structurally embarrassing.
 3. An audit-facing artifact (a downstream system citing Standing's receipt chain) needs the chain to terminate at something nameable. Probably first surfaces from the gauntlet's S5 `why` command, which is planned to join through `standing query why` (see [[project-standing-query-why-join-point]]).
 
-Until one of those fires: candidate-not-binding. Standing does not implement a `standing genesis` CLI verb yet, does not write `GenesisInstall` receipts on first run, does not retrofit existing instances.
+The operator explicitly promoted this candidate and genesis support landed on
+2026-06-10. Phase 4b–6 then added cryptographic parent linkage. Installation is
+explicit rather than an implicit first-run side effect, and existing chains are
+not retrofitted.
 
 ## Operator fiat is real
 
@@ -83,14 +104,23 @@ A receipt that names fiat as fiat is more honest than a chain that terminates in
 
 This is the same shape as the FiatAdmissibility doctrine in adjacent projects: fiat is not forbidden; fiat is required to be visible. Standing's genesis receipt is the local manifestation.
 
-## What this does not specify
+## Current limits
 
-- The CLI verb name (`standing genesis install --policy <path>` is plausible, not pinned).
-- Whether re-installs are allowed on the same instance under cited prior authority (probably no; replace the instance instead).
-- Whether the genesis receipt is signed by anything beyond the operator's identity substrate. Probably not — the substrate's strength applies, per the substrate-honesty limit (see README "Limitations").
-- Migration path for existing Standing instances that pre-date this spec. Likely: optional retrofit receipt with `migrated_at` field, explicitly noting that the *pre-spec* genesis cannot be reconstructed and the migration receipt names only the migration event, not the original install.
+- The CLI is `standing genesis install --identity <file> --secret <key>` with
+  optional `--policy-source <marker>`; `standing genesis show` reads it back.
+- Re-install is refused. If the genesis operator key is compromised, replace
+  the instance rather than rewriting its root.
+- The receipt inherits the verified operator's HMAC identity substrate; it does
+  not claim a stronger signature or institutional authority.
+- Existing pre-genesis grant chains are not retrofitted. A later genesis names
+  the installation event honestly; it cannot reconstruct earlier authority.
 - Whether the operator's identity must itself be ratified by some external authority. No — that is infinite-regress bait. The operator is the genesis; the genesis is fiat; the fiat is named; the chain stops.
 
 ## Provenance
 
-Filed 2026-06-10 from a review pass on Standing's README (Claude Fable, operator-relayed) which named the chain-termination gap explicitly: *"Without a genesis receipt, the system has a noble lineage that mysteriously begins at 'trust me bro.'"* No implementation work today; candidate spec only. Operator authority for this filing was itself a visible fiat ("fuck a forcing case, do it"), which is the exact authorial shape this spec is meant to make citable rather than silent.
+Filed 2026-06-10 from a review pass on Standing's README (Claude Fable,
+operator-relayed) which named the chain-termination gap explicitly: *"Without a
+genesis receipt, the system has a noble lineage that mysteriously begins at
+'trust me bro.'"* The original candidate wording is retained above as design
+stratigraphy. Genesis MVP landed the same day; Phase 4b–6 later rooted new grant
+and assertion chains at that receipt.

@@ -1,4 +1,8 @@
-> **Historical design/provenance.** Slice 1 implementation diverged; current architecture lives in README, AGENTS.md, and SLICE-1-CLOSEOUT.md. Do not rewrite this into current state — it preserves useful stratigraphy.
+> **Historical design/provenance.** Slice 1 implementation diverged. Current
+> architecture lives in README, AGENTS.md, `docs/consumer-integration.md`, and
+> `docs/remote-standing-boundary.md`; `SLICE-1-CLOSEOUT.md` is the annotated
+> historical baseline. Do not rewrite the body into current state — it
+> preserves useful stratigraphy.
 
 # nq-standing
 

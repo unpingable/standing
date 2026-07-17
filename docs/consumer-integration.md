@@ -9,6 +9,15 @@
 > **Composes with:** `docs/remote-standing-boundary.md`,
 > [[component-key-keytab]], [[lifecycle-freeze]].
 
+## Authority split before integration
+
+An assertion lease is never self-granted by its speaker. A verified operator
+whose principal matches the installed genesis actor issues the lease to a
+distinct verified actor. The actor may then activate/prove against its own
+lease; the genesis operator owns freeze/thaw. This preserves the boundary
+between identity (who is speaking), authority (who may grant standing), and the
+consumer's effect decision.
+
 ## The two integration paths
 
 A consumer that wants Standing to gate a binding/mutating effect has two entry
@@ -37,20 +46,26 @@ subject_scope  the CONCRETE subject being asserted about (matched against a
 audience       instance-qualified (e.g. "nq:main")
 now            the consumer's clock reading
 jti            REQUIRED in binding mode — a per-request single-use nonce
-body_digest    SHA-256 of the request body this assertion attests to
+body_digest    REQUIRED in binding mode — SHA-256 of the request body this
+               assertion attests to
 ```
+
+The Rust request type keeps `jti` and `body_digest` optional so advisory
+resolvers can assess posture without spending. `StoreResolver` refuses binding
+mode when either is absent.
 
 ### `RequestProof` (consumer → Standing, preflight/prove path)
 
-The per-request half of the Kerberos split. Its canonical signed body is FIXED
-(so a future MAC signs a stable shape):
+The per-request half of the Kerberos split. Its canonical signed body is fixed,
+and the MAC-verified path signs that stable shape:
 
 ```text
 proof_version  "standing.request_proof.v1"
 grant_id       the lease id
 actor          speaker principal id
 claim_kind     · subject_id · audience
-body_digest    optional
+body_digest    required for a body-bound binding request; the underlying type
+               remains optional for trusted-transport compatibility paths
 jti            single-use per audience
 issued_at      freshness anchor (MAC-verified path checks skew + age)
 ```
@@ -70,7 +85,9 @@ standing_enforced  false in visible_not_binding, true in binding  ← the bolt
 standing_basis     allowed_by_store_grant | <refusal vocabulary>
 verification_mode  "store_grant"
 resolver           "StoreResolver"
-scope · audience · evaluated_at · expires_at · reason
+actor · claim_kind · subject_scope · audience
+jti · body_digest · evaluated_at · expires_at · reason
+emitted_receipt_digest · reuse_bound · certified_sound
 ```
 
 ### `AssertCheckResult` (Standing → consumer, preflight path)
@@ -84,8 +101,23 @@ authorizes_effect   TRUE only on the spend path with a recorded receipt ← chec
 decision_mode       "preview" | "spend" | "resolved"
 emitted_receipt_digest   set iff a spend happened
 reuse_bound · certified_sound   "unbounded_kind_scope" / false for budgetless leases
-freshness           "within_validity"  (NOT full Fresh until MAC/skew land)
+freshness           "within_validity" on lease-aware resolve; the separate
+                    MAC-verified proof path also enforces request age/skew
+principal · consumer · claim_kind · target · effect
+grant_id · jti · body_digest   exact request/proof coordinates assessed
 ```
+
+Store-backed preview/spend first joins the preflight request to its proof. It
+refuses non-consumingly unless `principal == actor`, `consumer == audience`,
+`claim_kind` matches, and `target == subject_id`. A consumer must record the
+echoed coordinates with the decision and emitted receipt digest.
+
+`required_not_implemented` remains a possible result from the pure Phase 4a
+`assert check` classifier, which deliberately has no lease coordinates. The
+lease-aware preview/spend paths return available or denied.
+
+These fields report operational checks; they do not claim formal runtime
+conformance.
 
 ## The refusal vocabulary a consumer must handle
 
@@ -98,6 +130,9 @@ claim_kind_out_of_scope · subject_out_of_scope · audience_mismatch
 standing_expired · grant_not_yet_valid           window
 use_budget_exhausted                              L1 budget spent
 replay_detected                                   jti reused
+jti_required                                      binding replay nonce omitted
+body_digest_required · body_digest_invalid        binding payload absent/malformed
+request_proof_mismatch:<axis>                     preflight request and proof differ
 class_frozen:<handle>                             incident-mode freeze
 assertion_mac_invalid · clock_skew_exceeded · request_timestamp_out_of_window
 ```
@@ -108,8 +143,9 @@ Unknown future variants MUST be treated as conservative refusal.
 
 - **Truth.** Standing says the actor had *standing to assert*, not that the claim
   is true. NQ still decides what the evidence testifies to.
-- **A per-request unforgeable envelope in the MAC-less path.** `spend_assertion`
-  is scope+replay+window under trusted transport; the unforgeable envelope is
+- **A per-request unforgeable envelope in the MAC-less path.** Body binding
+  prevents an authorized request from being silently reinterpreted, but
+  `spend_assertion` still trusts its transport. The cryptographic envelope is
   `spend_assertion_verified` + audience keys (distribution deferred,
   [[component-key-keytab]]).
 - **Count-bounded reuse for unbounded leases.** An `--unbounded` lease is stamped

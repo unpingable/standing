@@ -1,7 +1,7 @@
 //! SQLite-backed replay guard for identity jti tracking.
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use standing_identity::ReplayGuard;
 
 /// Grace period past `expires_at` before a seen-jti entry is purgeable. Keeping
@@ -57,9 +57,10 @@ impl ReplayGuard for SqliteReplayGuard<'_> {
         // Only purge entries expired MORE than the skew grace ago, so a
         // just-expired jti stays defended across a clock disagreement.
         let cutoff = (Utc::now() - Duration::seconds(PURGE_SKEW_SECS)).to_rfc3339();
-        let result = self
-            .conn
-            .execute("DELETE FROM seen_jti WHERE expires_at < ?1", params![cutoff]);
+        let result = self.conn.execute(
+            "DELETE FROM seen_jti WHERE expires_at < ?1",
+            params![cutoff],
+        );
         match result {
             Ok(rows) => Ok(rows as u64),
             Err(e) => Err(e.to_string()),
@@ -72,9 +73,8 @@ mod tests {
     use super::*;
 
     fn setup() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
         // SqliteReplayGuard::new will create the table
-        conn
+        Connection::open_in_memory().unwrap()
     }
 
     #[test]
@@ -99,8 +99,16 @@ mod tests {
         let conn = setup();
         let mut guard = SqliteReplayGuard::new(&conn).unwrap();
         let exp = Utc::now() + chrono::Duration::seconds(300);
-        assert!(guard.check_and_record("jti-1", "standing:prod", exp).unwrap());
-        assert!(guard.check_and_record("jti-1", "standing:staging", exp).unwrap());
+        assert!(
+            guard
+                .check_and_record("jti-1", "standing:prod", exp)
+                .unwrap()
+        );
+        assert!(
+            guard
+                .check_and_record("jti-1", "standing:staging", exp)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -111,8 +119,12 @@ mod tests {
         let just_expired = Utc::now() - chrono::Duration::seconds(5); // within skew grace
         let future = Utc::now() + chrono::Duration::seconds(300);
 
-        guard.check_and_record("ancient", "standing", long_past).unwrap();
-        guard.check_and_record("just", "standing", just_expired).unwrap();
+        guard
+            .check_and_record("ancient", "standing", long_past)
+            .unwrap();
+        guard
+            .check_and_record("just", "standing", just_expired)
+            .unwrap();
         guard.check_and_record("live", "standing", future).unwrap();
 
         // Only "ancient" (past the skew grace) is purged; "just" is retained
@@ -121,7 +133,11 @@ mod tests {
         assert_eq!(purged, 1);
 
         // "ancient" is gone.
-        assert!(guard.check_and_record("ancient", "standing", future).unwrap());
+        assert!(
+            guard
+                .check_and_record("ancient", "standing", future)
+                .unwrap()
+        );
         // "just" is still defended despite being expired.
         assert!(!guard.check_and_record("just", "standing", future).unwrap());
         // "live" is still there.

@@ -1,12 +1,36 @@
 # Remote Standing Boundary — local manifestation
 
-> **Status:** `candidate / non-binding`. Names the surface Standing will eventually expose to cross-machine consumers. Does not authorize binding-grade enforcement in any consumer until each consumer's own local manifestation is filed and ratified.
+> **Status:** Standing-side implementation landed in Phase 4b–6; consumer
+> adoption remains `candidate / non-binding`. The assertion lease, request
+> proof, replay ledger, genesis-rooted issuance, freeze overlay, and binding
+> resolver exist and are tested. No NQ, Wicket, Nightshift, or other remote
+> deployment is claimed here. Each consumer must still file and implement its
+> own binding manifestation.
 >
 > **Composes with:** `~/git/cartography/coordination/nq-REMOTE_STANDING_BOUNDARY.md` (filed 2026-05-27 by notquery-Claude). That document is the cross-constellation primitive. This document is Standing's local manifestation of it.
 
+## 2026-07-17 scope sweep
+
+- Entitlement-to-assert is current product behavior, not an undesigned
+  roadmap schema. A genesis operator issues a bounded lease to a distinct
+  speaker; binding resolution spends it and emits a receipt.
+- A binding request is tied to the actor, claim kind, concrete subject,
+  audience, request-body digest, single-use nonce, and evaluation window.
+  Refusals are named and non-consuming. Origin hardening keeps the instance
+  genesis, identity `kid`, and lifecycle UUID/JTI distinct rather than
+  collapsing them into a reusable actor label; Standing does not claim a
+  universal serialized origin type.
+- Formal freshness/authority work informed those binding, refusal, and origin
+  constraints. Standing makes no runtime-conformance or formal-verification
+  claim.
+- Exceptional access remains a cross-system governed lifecycle, not a Standing
+  bypass. Promotion would require predelegated request-bound authority,
+  ordinary refusal revalidation, replay defense, durable audit, and persistent
+  reconciliation/disposition across the participating authority domains.
+
 ## Why this document exists
 
-Slice 1 of Standing closed (`SLICE-1-CLOSEOUT.md`, 2026-05-20) shipping entitlement-to-act: workload-identity-verified, scoped, time-bounded grants for `(actor, action, target)` tuples, with receipts at every state transition. That surface is local: actor, store, and policy live in the same process.
+Slice 1 of Standing closed (`SLICE-1-CLOSEOUT.md`, 2026-05-20) shipping entitlement-to-act: workload-identity-verified, scoped, time-bounded grants for `(actor, action, target)` tuples, with receipts at every state transition. Phase 4b–6 subsequently added the entitlement-to-assert implementation described here. Standing remains library/CLI embedded; this document does not imply a network service.
 
 NQ, Nightshift, and Wicket are not guaranteed to live in the same process — increasingly, not in the same machine. The moment a remote NQ submits a finding, or a remote Nightshift requests a closure, a new question lands at the boundary:
 
@@ -115,6 +139,9 @@ into audience B, within window [t0, t1]?
 
 Invariants (mirrored from the act primitive):
 
+- The speaker cannot mint its own standing. Assertion issuance requires a
+  separately verified genesis operator, and the operator principal must differ
+  from the lease actor.
 - Standing-to-assert does **not** mean the claim is true. It only means the actor is permitted to introduce that class of testimony to that audience. NQ still decides what the evidence can testify to. Nightshift still decides posture. Wicket still preflights action.
 - Standing-to-request does **not** mean the action is admissible. It means the actor is permitted to ask. Wicket decides whether the ask becomes a do.
 - Receipts at every state transition that *does* exist. Fail-closed on receipts.
@@ -135,9 +162,15 @@ subject_scope  the grant's coverage pattern; the class of subjects
                "ns/*".
 ```
 
-A `StandingRequest` carries a `subject_id` (the concrete thing being asserted about right now). A grant — `AssertionGrant` (Phase 4) or a `StaticConfigEntry` (MVP) — carries a `subject_scope` (the pattern of subjects the grant covers). The matching function asks: *does this grant's subject_scope cover that request's subject_id?*
+A `StandingRequest` carries the concrete thing being asserted about right now.
+An `AssertionGrant` or `StaticConfigEntry` carries the coverage pattern. The
+matching function asks: *does this grant's subject scope cover that request's
+subject id?*
 
-The current MVP code field is named `subject_scope` on both sides for slice-1 reasons; that does not need to change today. The doc stops conflating them, because the distinction is load-bearing for component-testimony and for the eventual Phase 4 lease-shaped grant.
+The Rust `StandingRequest` field is still named `subject_scope`, while
+`RequestProof` uses `subject_id`; the distinction is semantic and enforced even
+though the resolver field retains its older name. The Phase 4 lease-shaped
+grant is implemented.
 
 Sibling-side names for the same distinction:
 
@@ -164,7 +197,7 @@ RequestProof (per-request)
   for that audience, now, against that body
 ```
 
-Minimum fields a request proof must carry when binding-grade enforcement is live:
+Minimum fields a binding request proof carries:
 
 ```text
 grant_id
@@ -175,7 +208,17 @@ body_digest          (SHA-256 of canonical request body)
 mac / signature      (over the above, using the audience's expected key)
 ```
 
-MVP does not require the full request-proof envelope shipped on the wire — but the `StandingRequest` type in `standing-policy::resolver` carries the matching shape (`actor`, `claim_kind`, `subject_scope`, `audience`, `now`, optional `jti` and `body_digest`) so consumers building binding-grade flows later are not refactoring the trait.
+`StandingRequest` carries the matching shape (`actor`, `claim_kind`, concrete
+subject in the historically named `subject_scope` field, `audience`, `now`,
+optional `jti` and `body_digest`). Advisory resolvers may omit the optional
+fields. Binding `StoreResolver` requires both; the MAC-verified `RequestProof`
+path additionally verifies the signed envelope and request time window.
+
+The store-backed preflight path also joins its two inputs exactly before lease
+lookup or spend: request `principal/consumer/claim_kind/target` must equal proof
+`actor/audience/claim_kind/subject_id`. A mismatch is a named, non-consuming
+refusal, and `AssertCheckResult` echoes both the full request coordinates and
+the proof's `grant_id/jti/body_digest`.
 
 ## Canonical principal and audience names
 
@@ -243,7 +286,7 @@ Standing's resolver assesses requests carrying any of these action-classes; the 
 
 ## Scope matching semantics
 
-String scopes are policy, not decoration. Matching rules for MVP:
+String scopes are policy, not decoration. Current matching rules:
 
 ```text
 claim_kind        exact string match against the configured allowlist;
@@ -277,17 +320,26 @@ Standing-the-tool
   actor × claim_kind × subject_scope × audience × window
 ```
 
-These ladders **must not be projected into each other.** Standing's `AssertionGrant` will not be flattened into Wicket's `ActorStanding{class, provenance}` shape.
+These ladders **must not be projected into each other.** Standing's
+`AssertionGrant` is not flattened into Wicket's
+`ActorStanding{class, provenance}` shape.
 
 > Wicket's standing is operation-phase standing. Standing's standing is speaker/requester standing.
 
 Same word, different axis. The tax is paid in documentation.
 
-When the consumer-integration phase has a real plant, Wicket will likely grow a separate field — tentatively `Intent.caller_assertion_standing` — that carries Standing's output without collapsing it into the operation-role ladder. Naming finalized when the bridge has traffic, not before. **The bridge stays unbuilt until then.**
+When consumer integration has a real plant, Wicket may grow a separate field —
+tentatively `Intent.caller_assertion_standing` — that carries Standing's output
+without collapsing it into the operation-role ladder. Naming is finalized when
+the bridge has traffic, not before. **The consumer bridge remains unbuilt.**
 
-## Phase 4a — assertion-standing preflight surface (the door)
+## Phase 4a — historical preflight door and its current role
 
-The `AssertionGrant` lease lifecycle (Phase 4b) is consumer-gated and not yet built. But a consumer cannot present a clean forcing case for the lifecycle if Standing has no door for them to knock on. Phase 4a is that door.
+Phase 4a originally shipped a pure inquiry surface before the lease lifecycle
+existed. Phase 4b is now built. The pure `assert check` command remains useful
+for classifying whether an effect needs assertion standing, but it has no lease
+coordinates and therefore does not authorize or resolve availability. Use
+`assert resolve` for lease-aware preview/spend decisions.
 
 > The assertion-standing inquiry surface is freeze-safe under operator fiat because it does not authorize assertion. It makes absence observable.
 
@@ -302,7 +354,9 @@ standing assert check \
   --effect <descriptive|advisory|binding|mutating>
 ```
 
-and receives a structured `AssertCheckResult`:
+At Phase 4a, the binding case returned the following structured
+`AssertCheckResult` (historical example; it is not evidence that the current
+lease implementation is absent):
 
 ```json
 {
@@ -332,7 +386,7 @@ mutating      consumer mutates state on this basis; assert-standing required
 
 **Effect class is consumer-declared.** Standing does not infer it from `claim_kind`. Mis-declaring the effect class is the consumer's failure to refuse — Standing cannot defend against `"this is descriptive, I promise"` when downstream binds on it. The check surface gives the consumer the labeled door; the consumer chooses which door to knock on.
 
-### What Phase 4a is NOT
+### What the pure check is NOT
 
 ```text
 - Not minting any AssertionGrant
@@ -340,28 +394,30 @@ mutating      consumer mutates state on this basis; assert-standing required
 - Not emitting receipts on check (no state transition)
 - Not authorizing anything
 
-The check does not dissolve the freeze on lease lifecycle work. It
-preserves the freeze in a form consumers can actually hit.
+The check is not a substitute for the implemented lease-aware resolver.
 ```
 
-### The forcing-case detector
+### Historical forcing-case detector
 
-A consumer that calls `assert check` for a binding effect and receives `RequiredNotImplemented` has the citable forcing case Phase 4b needs:
+At the time, a consumer that called `assert check` for a binding effect and
+received `RequiredNotImplemented` supplied the citable forcing case Phase 4b
+needed:
 
 > "I am about to bind claim X. Standing says: yes, you need assert-standing, and none exists."
 
-That receipt — the structured refusal — is the wedge into Phase 4b. Without the door, consumers would have to invent Standing's missing interface, which is backwards.
+That structured refusal supplied the wedge into Phase 4b. The forcing event is
+satisfied; the lifecycle and resolver now exist.
 
 ### Decision variants
 
-Phase 4a ships two:
+The pure classifier uses:
 
 ```text
 NotRequired              effect is descriptive/advisory
-RequiredNotImplemented   effect is binding/mutating; no lifecycle yet
+RequiredNotImplemented   legacy pure-check result; never authorizes effect
 ```
 
-Phase 4b will add:
+The lease-aware preview/spend surface adds:
 
 ```text
 RequiredAndAvailable     grant exists, scope matches, fresh, audience-aligned
@@ -395,9 +451,11 @@ StaticConfigResolver
   Consumer-facing name: StaticConfigResolver.
 
 StoreResolver
-  Defers to Standing's assertion-grant store (post-MVP). Real
-  distributed-prod posture: caller identity + assertion grant with
-  revocation, expiry, audience, claim-kind scope.
+  Defers to Standing's implemented assertion-grant store. In
+  visible mode it previews without spending; in binding mode it
+  requires jti + body_digest, spends the lease, and emits an
+  AssertionMade receipt. A real deployment still needs verified
+  caller identity, key custody, and an explicit consumer flip.
   Consumer-facing name: StandingToolResolver.
 ```
 
@@ -407,11 +465,18 @@ StoreResolver
 unknown_peer                  caller identity not recognized
 unknown_issuer                grant carries unknown issuer (no realm trust)
 standing_absent               no grant or config entry covers this request
+no_covering_lease             no assertion lease covers the request coordinates
 standing_expired              matching grant exists but window has closed
 grant_not_yet_valid           grant exists but not_before is in the future
+use_budget_exhausted          bounded lease has no remaining spends
 claim_kind_out_of_scope       grant exists but does not cover this claim_kind
 subject_out_of_scope          grant exists but does not cover this subject
 audience_mismatch             grant exists but for a different audience
+jti_required                  binding request omitted its replay nonce
+body_digest_required          binding request omitted its payload digest
+body_digest_invalid           digest is not 64 hexadecimal SHA-256 characters
+request_proof_mismatch:<axis> preflight request and proof coordinates differ
+class_frozen:<handle>         receipt-bearing deny-overlay covers the request
 clock_skew_exceeded           verifier_time vs issuer_time delta > max skew
 request_timestamp_out_of_window  request is too old or too new to evaluate
 replay_detected               jti already seen in this audience's replay cache
@@ -423,7 +488,10 @@ Each surfaces in `StandingDecision.standing_basis` so consumers and operators ca
 
 ## Receipt attribution discipline
 
-Every `StandingDecision` recorded by a consumer must carry these fields. They are not optional. The trait's `StandingDecision` carries them by construction so consumers cannot drop them silently:
+Every `StandingDecision` recorded by a consumer must retain the exact claim
+coordinates and enforcement posture. The trait carries the decision fields;
+the consumer adds its declared `standing_mode` when embedding the decision in
+its own receipt:
 
 ```json
 {
@@ -433,6 +501,12 @@ Every `StandingDecision` recorded by a consumer must carry these fields. They ar
   "standing_enforced": false,
   "standing_verdict": "denied",
   "standing_basis": "static_config_no_match",
+  "actor": "component:nq:linode",
+  "claim_kind": "sqlite_wal_state",
+  "subject_scope": "host:storage01",
+  "jti": null,
+  "body_digest": null,
+  "emitted_receipt_digest": null,
   "scope": ["sqlite_wal_state:host:storage01"],
   "audience": "nq:linode",
   "expires_at": null,
@@ -440,7 +514,9 @@ Every `StandingDecision` recorded by a consumer must carry these fields. They ar
 }
 ```
 
-- `standing_mode` distinguishes `visible_not_binding` from `binding`. Mode is consumer-side; Standing records what the consumer told it.
+- `standing_mode` distinguishes `visible_not_binding` from `binding`. It is
+  consumer-side receipt context; `standing_enforced` is the resolver decision's
+  corresponding bit.
 - `verification_mode` distinguishes `static_config` from `store_grant` from `local_only` from `deny_all`. Different rigor; different basis.
 - `identity_substrate` records how the principal was authenticated — `hmac_workload_id` today, `mtls`/`oidc`/`spiffe` future.
 - `standing_enforced: false` makes it impossible to misread visible-not-binding as binding.
@@ -461,18 +537,21 @@ A consumer that wires Standing into a binding workflow must preserve the distinc
 
 ## Replay cache per audience
 
-Replay defense is **mandatory before binding-grade enforcement**:
+Replay defense is mandatory in binding mode and is implemented for assertion
+spends:
 
 ```text
 each audience maintains a seen_jti cache
 TTL tied to request validity window + max clock skew
 binding mode: replay refused with `replay_detected`
-visible mode: replay posture recorded, request still surfaceable
+visible mode: no spend and no replay-ledger mutation
 ```
 
 A single cross-audience replay table is **not** acceptable. Replays must be scoped to the audience the request was issued for — a jti accepted by `nq:linode` should not block the same jti issued for `nightshift:sushi-k`.
 
-The slice-1 store already has `seen_jti` for grant requests; extending it per-audience for assertion-grade flows is post-MVP work.
+The store has `seen_jti` for identity/grant requests and
+`seen_assertion_jti` keyed by audience for assertion spends. A committed nonce
+is refused on reuse; refusal does not consume lease budget.
 
 ## Delegation is denied by default
 
@@ -559,11 +638,16 @@ required documentation:
   kid association (which key produced which grant?)
 ```
 
-This document does not yet specify the keytab format — `docs/identity-substrate-gap.md` (roadmap Phase 6) is the future home. Naming the doctrine now prevents the slice-1 single-shared-secret model from being mistaken for the forever model.
+`KeyResolver`, `SingleKey`, and primary/legacy `KeySet` rotation support are
+implemented. [`component-key-keytab.md`](component-key-keytab.md) documents the
+current keytab shape and overlap procedure; key distribution/storage and
+per-audience deployment remain outside Standing. The symmetric HMAC substrate
+must not be mistaken for PKI.
 
 ## Realm / federation explicitly unsupported
 
-Standing borrows shape from Kerberos. People will look for realms. **MVP and 1.0 stance:**
+Standing borrows shape from Kerberos. People will look for realms. **Current
+supported stance:**
 
 ```text
 single issuer / local trust domain only
@@ -573,7 +657,10 @@ no transitive trust
 no multi-issuer conflict resolution
 ```
 
-A grant from an unknown issuer surfaces as `unknown_issuer`. Not "maybe trust because the signature validates." Not "fall back to the static config." Not "log a warning and proceed." Unknown issuers are refused, full stop, until federation is *explicitly* designed — which it is not, and not in 1.0.
+A grant from an unknown issuer surfaces as `unknown_issuer`. Not "maybe trust
+because the signature validates." Not "fall back to the static config." Not
+"log a warning and proceed." Unknown issuers are refused, full stop, until
+federation is *explicitly* designed.
 
 ## Kerberos lineage, not Kerberos mechanism
 
@@ -595,7 +682,7 @@ Summary of scars this design preserves rather than re-discovers:
 - revocation is TTL-first unless live checks are explicitly required
 - key material on disk has named blast radius
 - standing allowed does not mean claim true
-- no federation / cross-realm trust in MVP or 1.0
+- no federation / cross-realm trust in the supported scope
 - clock skew is explicit refusal, not silent forgiveness
 - authorization data is not truth
 ```
@@ -613,7 +700,9 @@ Mirrored from cartography:
 
 ## The subscription inversion (deferred)
 
-Standing's current shape — `StandingRequest`, `StandingDecision`, the four resolver modes, the assertion-grant lifecycle anticipated for Phase 4 — assumes **emission semantics**:
+Standing's current shape — `StandingRequest`, `StandingDecision`, the four
+resolver modes, and the implemented assertion-grant lifecycle — assumes
+**emission semantics**:
 
 ```text
 actor (speaker, upstream) → audience (listener, downstream)
@@ -633,7 +722,10 @@ Standing recognises the inversion but does not solve it here. The naming below i
 standing_kind = emit (assertion) | receive (subscription)
 ```
 
-Subscription wire shape, `StandingRequest` field-naming for the receive case, audience-direction discipline in receipts, and lease semantics for durable receive-standing all belong to Phase 4 or later. Naming the hole; not pouring concrete into it while the plumbers are still yelling.
+Phase 4 did not add subscription semantics. Its wire shape,
+`StandingRequest` naming for the receive case, audience-direction discipline in
+receipts, and durable receive-standing rules remain deferred to a concrete
+subscriber/producer integration.
 
 ## What this document does not specify
 
@@ -643,8 +735,12 @@ Deferred until forcing cases converge:
 - Cross-component receipt provenance format (NQ → Standing → Wicket → Nightshift).
 - Cross-component revocation propagation semantics.
 - Audit-aggregation surface (constellation-wide audit composition).
-- Daemon / HTTP service shape. Library-embedded through MVP and probably through 1.0.
-- **Producer-side time fields.** NQ-NS witness packets distinguish `generated_at` (producer-side, when the packet was minted) and `observed_at` (observer-side, when the underlying event was caught) from verifier-side `evaluated_at` / `now`. Standing today carries only verifier-side time. Phase 4 likely needs to carry producer-side time alongside; the MVP code is not retrofitted now.
+- Daemon / HTTP service shape. The current surface is library/CLI embedded.
+- **Producer-side time fields.** NQ-NS witness packets distinguish
+  `generated_at` (producer-side, when the packet was minted) and `observed_at`
+  (observer-side, when the underlying event was caught) from verifier-side
+  `evaluated_at` / `now`. Phase 4b added proof `issued_at`, but Standing still
+  does not model the underlying observation's producer timestamps.
 - **Subscription / receive-standing shape.** See "The subscription inversion" above.
 - **Full action-class and axis convergence.** Standing imports sibling vocabulary as provisional; cartography owns convergence; the lists in "Imported sibling vocabulary" are subject to extension from sibling filings.
 
@@ -692,7 +788,8 @@ NS (Nightshift)
 
 Standing's role across this set: speaker / requester entitlement, with `StandingDecision` as the artifact the others compose against. Standing does not own the per-component manifestation list; cartography curates it.
 
-**Forcing pressures on Phase 4** (consumer-gated lease-shaped `AssertionGrant` lifecycle), updated:
+**Historical forcing pressures that promoted Phase 4** (the consumer-side
+plants named here may still be unwired):
 
 ```text
 1. NQ binding flip — visible_not_binding → binding for remote
@@ -707,7 +804,8 @@ Standing's role across this set: speaker / requester entitlement, with `Standing
    needs lease semantics in a way one-shot reads do not.
 ```
 
-Any one of those gates Phase 4 by itself; the four together raise the priority but do not change the discipline. Standing waits for a concrete consumer to knock before building.
+These pressures promoted the Standing-side lifecycle and binding seam. They did
+not, by themselves, implement any consuming repository.
 
 ## Formal substrate alignment
 
@@ -756,9 +854,11 @@ The Frontier-1 safety-bridge family is the structural articulation of this docum
 
 ## Relationship to existing Standing docs
 
-- `README.md` — names entitlement-to-act as current, entitlement-to-assert as roadmap. This document is the entrance of that roadmap.
+- `README.md` — names both entitlement-to-act and entitlement-to-assert as
+  current Standing behavior, with consumer adoption explicitly lab-backed.
 - `docs/synthetic-boundary-probes.md` — pre-policy fence-line; remains valid. This document is the first named plant; probes are not superseded.
-- `SLICE-1-CLOSEOUT.md` — entitlement-to-act baseline. Hardening items remain 1.0-blocking, not MVP-blocking.
+- `SLICE-1-CLOSEOUT.md` — historical entitlement-to-act baseline with current
+  dispositions annotated.
 - `DESIGN.md` — historical / provenance; not authoritative for this surface.
 - `IDENTITY-SCARS.md` — identity layer scars; this document operates downstream of them. Identity is substrate.
 
@@ -775,7 +875,7 @@ Standing-to-assert does not mean the claim is true.
 Same word, different axis: Wicket standing classifies the operation role.
 Standing-the-tool classifies the speaker.
 
-Visible before binding. Binding only after hardening.
+Visible before binding. Binding only with hardening and an explicit consumer.
 
 Visible-not-binding applies to claim authority, not to storage abuse.
 
@@ -803,6 +903,28 @@ Paper-only reconciliation 2026-06-03 against the Lean admissibility kernel (`~/g
 
 Doctrine pass 2026-06-10 from a Claude Fable review (operator-relayed) plus follow-up cadence amendments. Added "Named invariants" block (state-not-cargo, model-not-principal, no-cache-without-lease, reverify-every-gate, substrate-strength), folded into the README as well. Filed two candidate specs (`docs/genesis-receipt.md` for the chain-termination gap, `docs/lifecycle-freeze.md` for the missing incident-mode lifecycle verb) — both `candidate / non-binding`, naming the shape pre-cooked so the next forcing event does not have to invent it under pressure. Refined Phase 4 forcing trigger as "binding actuation" — the unifying event behind the four named pressures, sharper than "consumer flips." No code changed.
 
-Genesis MVP landed 2026-06-10. `ReceiptKind::GenesisInstall`, `Store::install_genesis` / `Store::get_genesis`, `standing genesis install/show` verbs, `query why` footer. SQLite partial unique index enforces exactly-one-per-instance. Cryptographic parent-linkage of grant receipts to genesis deferred until a forcing event names it.
+Genesis MVP landed 2026-06-10. `ReceiptKind::GenesisInstall`,
+`Store::install_genesis` / `Store::get_genesis`, `standing genesis
+install/show` verbs, and the `query why` footer shipped. SQLite enforces one
+genesis receipt. At that point cryptographic parent linkage was still deferred;
+Phase 4b–6 later landed it for new act-grant and assertion-lease chains.
 
-Phase 4a landed 2026-06-10 under incoming NQ-Gov-Wicket demo pressure. Built the assertion-standing preflight/refusal door (`standing assert check`, `AssertCheckRequest`/`Result`, `EffectClass`, `check_assert`) without the room: no `AssertionGrant` minting, no lease, no persistence, no delegation. Freeze on lifecycle work preserved; the door is what consumers can knock on while the room stays unbuilt. Two decision variants (NotRequired, RequiredNotImplemented); the structured refusal IS the forcing-case detector for Phase 4b.
+Phase 4a landed 2026-06-10 under incoming NQ-Gov-Wicket demo pressure. It
+built the pure assertion-standing classifier/refusal door (`standing assert
+check`, `AssertCheckRequest`/`Result`, `EffectClass`, `check_assert`) before the
+room existed. This paragraph records that point in the chronology, not current
+capability.
+
+Phase 4b–6 landed 2026-07-03: `AssertionGrant` lifecycle and bounded spends,
+genesis-rooted issuance, per-audience replay, request-proof MAC/time checks,
+`KeyResolver`/`KeySet`, freeze/thaw, four-variant lease resolution, and
+`StoreResolver` binding/visible modes. The accompanying demo is lab-backed
+compatibility evidence; it does not claim a live consumer.
+
+The 2026-07-17 scope sweep reconciled the paper with that implementation and a
+fresh authority review: lease speakers cannot self-grant; the verified genesis
+operator issues to a distinct actor and owns freeze/thaw; binding resolution
+requires an exact request-body digest and replay nonce; refusals remain
+non-consuming and specific. Formal work informed these constraints but confers
+no runtime-conformance claim. Exceptional access remains deliberately
+non-absorbed cross-system work.

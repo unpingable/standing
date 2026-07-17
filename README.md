@@ -12,7 +12,12 @@ Kerberos made service access presentable. Standing makes consequence entitlement
 
 Standing does not implement Kerberos-style ticket transport. Grants are recorded and verified against authoritative state rather than carried by workloads or agents as self-justifying legitimacy.
 
-Current Standing models **entitlement-to-act**: whether an actor may perform an operation against a target. Agentic systems also expose a neighboring need, **entitlement-to-assert**, where the relevant object is a claim that may affect downstream consequence. That surface is roadmap only; its schema and receipt format are not yet designed.
+Standing models both **entitlement-to-act** (may an actor perform an operation
+against a target?) and **entitlement-to-assert** (may a speaker introduce this
+class of claim about this subject to this audience?). Assertion standing ships
+as a time-bounded, use-budgeted lease with replay defense, freeze/thaw, binding
+resolution, and receipt-bearing spends. The integration surface is lab-backed;
+no live NQ, Wicket, or Nightshift deployment is claimed.
 
 ## 30-second specimen
 
@@ -44,10 +49,12 @@ standing query why --id <grant-id>
 #   grant activated:  digest: 0c31ae4a…  time: …:27.132
 ```
 
-The full receipt chain — issued, activated, refused — survives the refusal.
-Setup for this run (identities + operator-fiat genesis) is the first four
-commands of the Quick start below; the timestamps and digests above came from
-a real run.
+The issued/activated receipt chain survives unchanged. The expired attempt is a
+structured, non-consuming refusal: because no state transition occurred,
+Standing emits no transition receipt for it. A later query still shows the last
+authorized state and the window that caused refusal. Setup for this run
+(identities + operator-fiat genesis) is the first four commands of the Quick
+start below; the timestamps and digests above came from a real run.
 
 ## Invariants
 
@@ -79,15 +86,21 @@ Re-verify at every consequence-bearing gate.
 ## What it does
 
 - Tracks grant lifecycles: request, issue/deny, activate, use, expire, revoke, abandon
+- Tracks assertion-lease lifecycles: issue, activate, prove, exhaust, expire, revoke
 - Produces content-addressed receipts at every state transition
 - Answers "why was this allowed?" by walking receipt chains
 - Evaluates policy decisions with pinned policy hashes
+- Resolves assertion standing in advisory or binding mode, with replay and
+  request-body binding on the binding path
+- Freezes and thaws grant classes as a receipt-bearing incident-mode overlay
 - Stores everything in SQLite with fail-closed atomic transitions
 
 ## What this is not
 
 - Not an identity provider, policy engine, admissibility governor, actuator, workflow engine, or agent platform
-- Not claim preflight or witness/testimony infrastructure; adjacent systems such as [NQ](https://github.com/jbeck/nq) answer what can be said from evidence
+- Not a truth or evidence evaluator; assertion standing says who may speak in a
+  role, while systems such as [NQ](https://github.com/jbeck/nq) decide what the
+  evidence can testify to
 - Not an admissibility lock; an admissibility layer such as Wicket or a consuming [Governor](https://github.com/jbeck/agent_gov) decides whether entitlement may bind consequence
 - Not a secret store, service mesh, workforce IAM, or PKI project
 
@@ -134,12 +147,28 @@ standing query chain --id <grant-id>
 # Sweep expired grants (system actor)
 standing grant sweep
 
-# Phase 4a — assertion-standing preflight (door, not room).
-# Consumer asks "do I need assert-standing for this effect?"
+# Pure, non-authorizing effect classification: does this operation require
+# assertion standing? This check neither finds nor spends a lease.
 standing assert check \
   --principal component:nq:linode --consumer wicket:local \
   --claim-kind deploy_authorization --target prod/web-api \
   --effect binding
+
+# The genesis operator issues a bounded assertion lease to a distinct speaker.
+standing assert grant \
+  --identity bot.id.json --secret my-key \
+  --operator-identity op.id.json --operator-secret my-key \
+  --claim-kind deploy_authorization --subject-scope 'prod/*' \
+  --audience wicket:local --max-uses 3
+
+# A binding consumer spends the lease. Binding requires a replay nonce and the
+# SHA-256 digest of the request body; success emits an AssertionMade receipt.
+standing assert resolve \
+  --principal wl:deploy-bot:host-abc --consumer wicket:local \
+  --claim-kind deploy_authorization --target prod/web-api --effect binding \
+  --id <assertion-grant-id> --identity bot.id.json --secret my-key \
+  --subject-id prod/web-api --jti <single-use-nonce> \
+  --body-digest <sha256-of-request-body>
 ```
 
 ## Architecture
@@ -158,11 +187,22 @@ deploy-bot ──request──> [policy engine] ──decision receipt──> [g
                                                          standing query why
 ```
 
+The assertion path uses the same authoritative store and receipt kernel, but
+splits authority explicitly: the genesis operator issues a lease to a distinct
+speaker; the speaker presents a nonce- and body-bound proof; a binding resolver
+spends the lease before the consumer may treat the claim as consequential.
+
 Receipt format: canonical JSON (RFC 8785 / JCS) + SHA-256. WLP-compatible.
 
 ## Limitations
 
-The fail-closed chain is only as strong as the identity substrate beneath it. Slice-1 Standing verifies workload identity via HMAC over a shared secret per principal. That is a named limit, not a placeholder for inherited PKI rigor — receipts inherit the cryptographic strength of the substrate, not more. Upgrading the substrate (mTLS, OIDC, SPIFFE) is a separate decision with its own forcing case; `docs/identity-substrate-gap.md` is the roadmap home.
+The fail-closed chain is only as strong as the identity substrate beneath it.
+Standing verifies workload identity and request proofs with symmetric HMAC
+keys. `kid`-based lookup and primary/legacy rotation are implemented, but key
+distribution, storage, and asymmetric trust remain outside Standing. Receipts
+inherit the cryptographic strength of that substrate, not more; see
+[`docs/component-key-keytab.md`](docs/component-key-keytab.md) and
+[`docs/compromise-recovery.md`](docs/compromise-recovery.md).
 
 Standing is also a single point of authority by design. Authority unreachable means fail-closed means nothing acts. For consequence-bearing operations that is the correct polarity. A future proposal to "cache standing decisions for resilience" is the bearer-token failure mode sneaking back in through the availability door, and is refused by the no-cache-without-lease invariant above.
 

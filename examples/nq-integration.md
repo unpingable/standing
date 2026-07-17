@@ -1,14 +1,16 @@
 # Example: NQ integration in `standing_visible_not_binding` mode
 
-> **Status:** integration walkthrough, not a contract. Names a candidate
-> shape for NQ to consume Standing's `StaticConfigResolver` when accepting
-> remote preflight submissions across machines. The actual integration
-> lives in `~/git/nq`; this file is the cold-readable handoff so an NQ
-> maintainer can wire it up without re-deriving the doctrine.
+> **Status:** Static advisory integration walkthrough, not a contract or a
+> claim about live NQ. It names a candidate shape for NQ to consume
+> `StaticConfigResolver` when accepting remote preflight submissions. Standing
+> now also ships the assertion-lease-backed `StoreResolver` and binding spend
+> path; those are intentionally not smuggled into this visible-not-binding
+> example. The actual consumer integration belongs in NQ.
 >
 > Reads alongside `docs/remote-standing-boundary.md`. Numbers in this file
-> assume current NQ shape as of 2026-05-27 (pull-only topology, two claim
-> tracks, no remote ingestion path yet).
+> preserve an NQ snapshot from 2026-05-27 (pull-only topology, two claim
+> tracks, no remote ingestion path). Treat that as historical input and verify
+> NQ's current shape before implementing the proposed route.
 
 ## The pressure
 
@@ -54,6 +56,9 @@ async fn api_ingest_remote_preflight(
         Utc::now(),
     ).map_err(IngestError::StandingRequest)?;
 
+    // Visible-not-binding does not spend, so this walkthrough does not add a
+    // jti/body digest. A StoreResolver binding request MUST add both.
+
     // 3. Ask Standing.
     let decision = standing.assess(&req)
         .map_err(IngestError::StandingResolve)?;
@@ -75,6 +80,14 @@ async fn api_ingest_remote_preflight(
                 "standing_verdict": decision.verdict,
                 "standing_basis": decision.standing_basis,
                 "resolver": decision.resolver,
+                "actor": decision.actor,
+                "claim_kind": decision.claim_kind,
+                "subject_scope": decision.subject_scope,
+                "jti": decision.jti,
+                "body_digest": decision.body_digest,
+                "emitted_receipt_digest": decision.emitted_receipt_digest,
+                "reuse_bound": decision.reuse_bound,
+                "certified_sound": decision.certified_sound,
                 "scope": decision.scope,
                 "audience": decision.audience,
                 "evaluated_at": decision.evaluated_at,
@@ -166,16 +179,18 @@ Matching semantics are fixed (see `docs/remote-standing-boundary.md`
 - **Identity verification.** Standing's resolver assumes the caller has
   already produced a verified canonical `Principal`. mTLS, HMAC, OIDC —
   Standing doesn't care, but identity is upstream of the resolver call.
-- **Binding-grade enforcement.** Visible-not-binding mode records the
-  standing decision but does not refuse the ingestion on a `Denied`
-  verdict. Binding mode (`ResolverMode::Binding`) is a later flip; it
-  requires the hardening in Phase 5 of the roadmap (`KeySet`/`kid`
-  rotation, per-audience replay cache, clock-skew enforcement,
-  compromise recovery doctrine).
-- **An `AssertionGrant` lifecycle.** The MVP `StaticConfigResolver`
-  needs no grant store. When NQ wants per-actor revocation, dynamic
-  scope changes, or operator-issued time-bounded grants, that arrives
-  with Phase 4 (`StoreResolver` + `AssertionGrant` lifecycle).
+- **Binding-grade enforcement in this walkthrough.** Visible-not-binding mode
+  records a denied decision but does not refuse ingestion. Standing's binding
+  `StoreResolver`, time/use-bounded `AssertionGrant`, per-audience replay
+  ledger, request-body requirement, MAC proof option, key rotation primitives,
+  and compromise doctrine are implemented. NQ must still make an explicit
+  consumer-side binding decision, verify identity, provide `jti` plus
+  `body_digest`, and record/refuse the result; this file does not claim that
+  integration has happened.
+- **Lease issuance.** `StaticConfigResolver` needs no grant store. A real
+  lease-backed integration has the genesis operator issue a bounded lease to a
+  distinct speaker and uses `StoreResolver`; see
+  `docs/consumer-integration.md` and `examples/nq-gov-wicket-demo.sh`.
 - **Cross-component receipt provenance.** A chain from NQ's preflight
   receipt back to Standing's decision (and forward to Wicket's
   preflight admission, and onward to Nightshift's closure assessment)
@@ -204,8 +219,8 @@ ingestion receipt embeds.
 standing resolver list-modes
 ```
 
-Lists the four resolver modes Standing ships, with the consumer-facing
-names from the cartography doctrine.
+Lists the three implementations exercised by `resolver test` and points to
+`standing assert resolve` for the fourth, store-backed assertion-lease path.
 
 ## Keepers for the NQ side
 

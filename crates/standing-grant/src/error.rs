@@ -24,9 +24,14 @@ pub enum GrantError {
     #[error("assertion lease use budget exhausted (max_uses {max_uses})")]
     BudgetExhausted { max_uses: u64 },
 
-    #[error("cannot issue an assertion lease with no genesis installed; \
-             issuance requires a prior settlement-witness (see docs/genesis-receipt.md)")]
+    #[error(
+        "cannot issue an assertion lease with no genesis installed; \
+             issuance requires a prior settlement-witness (see docs/genesis-receipt.md)"
+    )]
     NoGenesis,
+
+    #[error("assertion speaker {0} cannot authorize its own lease")]
+    AssertionSelfGrant(String),
 
     #[error("receipt error: {0}")]
     Receipt(#[from] standing_receipt::ReceiptError),

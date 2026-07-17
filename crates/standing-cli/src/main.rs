@@ -1,15 +1,18 @@
 use clap::{Parser, Subcommand};
 use standing_grant::{
-    ActorContext, AssertionGrantMachine, AssertionGrantRequest, AssertionGrantState, AssertionScope,
-    GrantMachine, GrantRequest, GrantScope, Principal, RequestProof,
+    ActorContext, AssertionGrantRequest, AssertionGrantState, AssertionScope, GrantRequest,
+    GrantScope, GrantState, Principal, RequestProof,
 };
-use standing_identity::{WorkloadId, verify_and_resolve, verify_and_resolve_with_replay, CreateOptions, ReplayGuard, VerifyOptions};
+use standing_identity::{
+    CreateOptions, ReplayGuard, VerifyOptions, WorkloadId, verify_and_resolve,
+    verify_and_resolve_with_replay,
+};
 use standing_policy::{
-    check_assert, AssertCheckRequest, DenyAllResolver, EffectClass, HardcodedPolicy,
-    LocalOnlyResolver, PolicyEvaluator, ResolverMode, StandingRequest, StandingResolver,
-    StaticConfig, StaticConfigResolver, Verdict,
+    AssertCheckRequest, DenyAllResolver, EffectClass, HardcodedPolicy, LocalOnlyResolver,
+    ResolverMode, StandingRequest, StandingResolver, StaticConfig, StaticConfigResolver,
+    check_assert,
 };
-use standing_store::{AssertionGrantMeta, GrantMeta, Store};
+use standing_store::Store;
 
 #[derive(Parser)]
 #[command(name = "standing", about = "Standing/entitlement observability")]
@@ -51,9 +54,9 @@ enum Commands {
         #[command(subcommand)]
         action: GenesisAction,
     },
-    /// Assertion-standing preflight surface (Phase 4a — door, not room).
-    /// Consumers ask "do I need assert-standing for this effect?" and get
-    /// a structured answer. Does not authorize. See docs/remote-standing-boundary.md.
+    /// Assertion-standing preflight, lease lifecycle, proof, and resolution.
+    /// Checks are non-authorizing; lease spends can authorize binding effects.
+    /// See docs/remote-standing-boundary.md.
     Assert {
         #[command(subcommand)]
         action: AssertAction,
@@ -73,7 +76,7 @@ enum PolicyAction {
         /// Incident handle / freeze id (citable).
         #[arg(long)]
         handle: String,
-        /// What to freeze on: claim_kind | actor | audience
+        /// What to freeze on: claim_kind | action | actor | audience
         #[arg(long, name = "class-type")]
         class_type: String,
         #[arg(long, name = "class-value")]
@@ -136,10 +139,18 @@ enum AssertAction {
     /// verified identity; scope it by claim_kind × subject_scope × audience;
     /// bound it by a validity window and a use budget.
     Grant {
+        /// Verified identity of the lease actor (the speaker receiving
+        /// entitlement-to-assert).
         #[arg(long)]
         identity: String,
         #[arg(long)]
         secret: String,
+        /// Verified genesis operator identity authorizing this issuance. Must
+        /// match the installed genesis actor and differ from the lease actor.
+        #[arg(long, name = "operator-identity")]
+        operator_identity: String,
+        #[arg(long, name = "operator-secret")]
+        operator_secret: String,
         #[arg(long, name = "claim-kind")]
         claim_kind: String,
         /// Coverage pattern (exact or trailing-`/*`), e.g. "labelwatch/*"
@@ -499,7 +510,8 @@ fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Err
                 audience,
                 ..CreateOptions::default()
             };
-            let id = standing_identity::create_identity(&name, &location, secret.as_bytes(), &opts)?;
+            let id =
+                standing_identity::create_identity(&name, &location, secret.as_bytes(), &opts)?;
             let json = serde_json::to_string_pretty(&id)?;
             println!("{json}");
         }
@@ -510,8 +522,8 @@ fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Err
         } => {
             let data = std::fs::read_to_string(&identity)
                 .map_err(|e| format!("cannot read identity file: {e}"))?;
-            let wid: WorkloadId = serde_json::from_str(&data)
-                .map_err(|e| format!("malformed identity file: {e}"))?;
+            let wid: WorkloadId =
+                serde_json::from_str(&data).map_err(|e| format!("malformed identity file: {e}"))?;
             let opts = VerifyOptions {
                 expected_audience: audience,
                 ..VerifyOptions::default()
@@ -581,78 +593,25 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                 context: serde_json::json!({}),
             };
 
-            // Root the chain at the instance genesis when one exists, so the
-            // walk terminates AT the operator-fiat root, not beside it.
-            let genesis_root = store.get_genesis()?.map(|g| g.digest);
-            let mut machine = GrantMachine::request_rooted(&req, genesis_root.as_deref())?;
-            let grant_id = machine.grant_id();
-
-            let requested_receipt = machine.chain.tip().clone();
-            store.record_transition(
-                grant_id,
-                &machine.state,
-                &requested_receipt,
-                Some(GrantMeta {
-                    subject_id: principal.id.clone(),
-                    actor: principal.label.clone(),
-                    action: action.clone(),
-                    target: target.clone(),
-                    issued_at: None,
-                    expires_at: None,
-                    not_before,
-                }),
-            )?;
-
             let policy = HardcodedPolicy;
-            let decision =
-                policy.evaluate(&req, &grant_id.to_string(), &requested_receipt.digest)?;
+            let created = store.create_grant(&req, &policy)?;
 
-            store.record_transition(grant_id, &machine.state, &decision.receipt, None)?;
-
-            match decision.verdict {
-                Verdict::Allow => {
-                    machine.issue(
-                        duration,
-                        &decision.policy_hash,
-                        serde_json::json!({"verdict": "allow", "reason": decision.reason}),
-                    )?;
-                    let issue_receipt = machine.chain.tip().clone();
-                    let state = machine.state.clone();
-                    let grant = machine.grant.as_ref().unwrap();
-                    let issued_at = grant.issued_at;
-                    let expires_at = grant.expires_at;
-                    let grant_not_before = grant.not_before;
-                    store.record_transition(
-                        grant_id,
-                        &state,
-                        &issue_receipt,
-                        Some(GrantMeta {
-                            subject_id: principal.id,
-                            actor: principal.label,
-                            action,
-                            target,
-                            issued_at: Some(issued_at),
-                            expires_at: Some(expires_at),
-                            not_before: grant_not_before,
-                        }),
-                    )?;
-                    println!("granted {grant_id}");
+            match created.state {
+                GrantState::Issued => {
+                    let expires_at = created
+                        .expires_at
+                        .expect("an issued grant always has an expiry");
+                    println!("granted {}", created.grant_id);
                     println!("  subject: {}", req.subject.id);
                     println!("  expires: {}", expires_at.to_rfc3339());
-                    println!("  receipt: {}", issue_receipt.digest);
+                    println!("  receipt: {}", created.final_receipt.digest);
                 }
-                Verdict::Deny => {
-                    machine.deny(
-                        &decision.policy_hash,
-                        serde_json::json!({"verdict": "deny", "reason": decision.reason}),
-                    )?;
-                    let deny_receipt = machine.chain.tip().clone();
-                    let state = machine.state.clone();
-                    store.record_transition(grant_id, &state, &deny_receipt, None)?;
-                    println!("denied {grant_id}");
-                    println!("  reason: {}", decision.reason);
-                    println!("  receipt: {}", deny_receipt.digest);
+                GrantState::Denied => {
+                    println!("denied {}", created.grant_id);
+                    println!("  reason: {}", created.reason);
+                    println!("  receipt: {}", created.final_receipt.digest);
                 }
+                state => unreachable!("create_grant returned unexpected state {state}"),
             }
         }
         GrantAction::Activate {
@@ -708,9 +667,9 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
 
             if json {
                 // standing.grant_use.v1 — machine-readable witness packet (D010c).
-                let granted_json = granted.as_ref().map(|(a, t)| {
-                    serde_json::json!({ "action": a, "target": t })
-                });
+                let granted_json = granted
+                    .as_ref()
+                    .map(|(a, t)| serde_json::json!({ "action": a, "target": t }));
                 match result {
                     Ok(r) => {
                         let packet = serde_json::json!({
@@ -791,33 +750,34 @@ fn handle_grant(db_path: &str, action: GrantAction) -> Result<(), Box<dyn std::e
                 // Only sweep non-terminal grants with an expiry in the past
                 if (g.state == "issued" || g.state == "active")
                     && let Some(ref exp_str) = g.expires_at
-                        && let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp_str)
-                            && now >= exp.to_utc() {
-                                if dry_run {
-                                    println!(
-                                        "would expire: {} {} {} → {} (expired {})",
-                                        g.id, g.actor, g.action, g.target, exp_str
-                                    );
-                                } else {
-                                    match store.transition(
-                                        &g.id,
-                                        standing_grant::GrantState::Expired,
-                                        standing_receipt::ReceiptKind::GrantExpired,
-                                        &system_ctx,
-                                        serde_json::json!({"swept_at": now.to_rfc3339()}),
-                                        None,
-                                    ) {
-                                        Ok(r) => {
-                                            println!("expired {} (receipt: {})", g.id, r.receipt_digest);
-                                        }
-                                        Err(e) => {
-                                            // CAS conflict or already transitioned — tolerate
-                                            eprintln!("skip {}: {e}", g.id);
-                                        }
-                                    }
-                                }
-                                expired_count += 1;
+                    && let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp_str)
+                    && now >= exp.to_utc()
+                {
+                    if dry_run {
+                        println!(
+                            "would expire: {} {} {} → {} (expired {})",
+                            g.id, g.actor, g.action, g.target, exp_str
+                        );
+                    } else {
+                        match store.transition(
+                            &g.id,
+                            standing_grant::GrantState::Expired,
+                            standing_receipt::ReceiptKind::GrantExpired,
+                            &system_ctx,
+                            serde_json::json!({"swept_at": now.to_rfc3339()}),
+                            None,
+                        ) {
+                            Ok(r) => {
+                                println!("expired {} (receipt: {})", g.id, r.receipt_digest);
                             }
+                            Err(e) => {
+                                // CAS conflict or already transitioned — tolerate
+                                eprintln!("skip {}: {e}", g.id);
+                            }
+                        }
+                    }
+                    expired_count += 1;
+                }
             }
 
             if expired_count == 0 {
@@ -860,22 +820,24 @@ fn print_actor_from_evidence(evidence_str: &str) {
                 println!();
             }
             if let Some(label) = actor.get("label")
-                && label.as_str() != actor.get("principal_id").and_then(|v| v.as_str()) {
-                    println!("    label:  {label}");
-                }
+                && label.as_str() != actor.get("principal_id").and_then(|v| v.as_str())
+            {
+                println!("    label:  {label}");
+            }
         }
         if let Some(detail) = ev.get("detail")
-            && !detail.is_null() && detail != &serde_json::Value::Object(serde_json::Map::new()) {
-                println!("    detail: {detail}");
-            }
+            && !detail.is_null()
+            && detail != &serde_json::Value::Object(serde_json::Map::new())
+        {
+            println!("    detail: {detail}");
+        }
     }
 }
 
 fn handle_resolver(action: ResolverAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         ResolverAction::ListModes => {
-            // Mirror docs/remote-standing-boundary.md § "The four resolver modes".
-            println!("Standing ships four resolver modes (StandingResolver implementations):");
+            println!("`standing resolver test` supports three resolver implementations:");
             println!();
             println!("  deny_all       refuses every request; panic-button / test scaffold");
             println!("                 (consumer-facing name: DenyAllResolver)");
@@ -888,9 +850,8 @@ fn handle_resolver(action: ResolverAction) -> Result<(), Box<dyn std::error::Err
             println!("                 allowlist from TOML; the MVP-enabling resolver");
             println!("                 (consumer-facing name: StaticConfigResolver)");
             println!();
-            println!("  store_grant    (post-MVP) defers to Standing's assertion-grant store;");
-            println!("                 real distributed-prod posture with grant lifecycle");
-            println!("                 (consumer-facing name: StandingToolResolver)");
+            println!("Store-backed assertion leases use `standing assert resolve`, not");
+            println!("`standing resolver test`.");
         }
         ResolverAction::Test {
             resolver,
@@ -925,9 +886,8 @@ fn handle_resolver(action: ResolverAction) -> Result<(), Box<dyn std::error::Err
                 "deny_all" => DenyAllResolver::new(mode).assess(&request)?,
                 "local_only" => LocalOnlyResolver::new(mode).assess(&request)?,
                 "static_config" => {
-                    let path = config.ok_or({
-                        "static_config resolver requires --config <path-to-toml>"
-                    })?;
+                    let path =
+                        config.ok_or("static_config resolver requires --config <path-to-toml>")?;
                     let cfg = StaticConfig::load(std::path::Path::new(&path))?;
                     StaticConfigResolver::new(cfg, mode).assess(&request)?
                 }
@@ -968,35 +928,38 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                     println!("      policy: {ph}");
                 }
                 if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence)
-                    && !ev.is_null() {
-                        // Show structured actor/subject if present
-                        if let Some(actor) = ev.get("actor")
-                            && let Some(pid) = actor.get("principal_id") {
-                                print!("      principal: {pid}");
-                                if let Some(role) = actor.get("role") {
-                                    print!(" (role: {role})");
-                                }
-                                println!();
-                            }
-                        if let Some(sid) = ev.get("subject_id") {
-                            println!("      subject: {sid}");
+                    && !ev.is_null()
+                {
+                    // Show structured actor/subject if present
+                    if let Some(actor) = ev.get("actor")
+                        && let Some(pid) = actor.get("principal_id")
+                    {
+                        print!("      principal: {pid}");
+                        if let Some(role) = actor.get("role") {
+                            print!(" (role: {role})");
                         }
-                        // Show detail (the user-provided evidence)
-                        if let Some(detail) = ev.get("detail")
-                            && !detail.is_null() {
-                                println!("      detail: {detail}");
-                            }
-                        // For receipts without the actor/subject structure, show raw
-                        if ev.get("actor").is_none() {
-                            println!(
-                                "      evidence: {}",
-                                serde_json::to_string_pretty(&ev)?
-                                    .lines()
-                                    .collect::<Vec<_>>()
-                                    .join("\n               ")
-                            );
-                        }
+                        println!();
                     }
+                    if let Some(sid) = ev.get("subject_id") {
+                        println!("      subject: {sid}");
+                    }
+                    // Show detail (the user-provided evidence)
+                    if let Some(detail) = ev.get("detail")
+                        && !detail.is_null()
+                    {
+                        println!("      detail: {detail}");
+                    }
+                    // For receipts without the actor/subject structure, show raw
+                    if ev.get("actor").is_none() {
+                        println!(
+                            "      evidence: {}",
+                            serde_json::to_string_pretty(&ev)?
+                                .lines()
+                                .collect::<Vec<_>>()
+                                .join("\n               ")
+                        );
+                    }
+                }
                 println!();
             }
 
@@ -1061,11 +1024,13 @@ fn handle_query(db_path: &str, action: QueryAction) -> Result<(), Box<dyn std::e
                         println!("    digest: {}", r.digest);
                         println!("    time:   {}", r.timestamp);
                         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&r.evidence)
-                            && let Some(reason) = ev.get("reason") {
-                                println!("    reason: {reason}");
-                            }
+                            && let Some(reason) = ev.get("reason")
+                        {
+                            println!("    reason: {reason}");
+                        }
                     }
-                    "grant_activated" | "grant_used" | "grant_revoked" | "grant_expired" | "grant_abandoned" => {
+                    "grant_activated" | "grant_used" | "grant_revoked" | "grant_expired"
+                    | "grant_abandoned" => {
                         println!("\n  {}:", r.kind.replace('_', " "));
                         println!("    digest: {}", r.digest);
                         println!("    time:   {}", r.timestamp);
@@ -1109,21 +1074,14 @@ fn print_genesis_footer(store: &Store) -> Result<(), Box<dyn std::error::Error>>
         }
         None => {
             println!("\n  ── chain root ──");
-            println!(
-                "  no genesis receipt installed — chain terminates in silence."
-            );
-            println!(
-                "  run `standing genesis install` to make the operator-fiat root citable."
-            );
+            println!("  no genesis receipt installed — chain terminates in silence.");
+            println!("  run `standing genesis install` to make the operator-fiat root citable.");
         }
     }
     Ok(())
 }
 
-fn handle_genesis(
-    db_path: &str,
-    action: GenesisAction,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_genesis(db_path: &str, action: GenesisAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         GenesisAction::Install {
             identity,
@@ -1146,7 +1104,10 @@ fn handle_genesis(
             println!("  digest:     {}", receipt.digest);
             println!("  operator:   {}", receipt.actor);
             println!("  instance:   {instance_id}");
-            println!("  policy:     {}", receipt.policy_hash.as_deref().unwrap_or(""));
+            println!(
+                "  policy:     {}",
+                receipt.policy_hash.as_deref().unwrap_or("")
+            );
             println!("  source:     {policy_source}");
             println!("  basis:      operator_fiat");
             println!("  time:       {}", receipt.timestamp);
@@ -1205,13 +1166,8 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
                 }
             };
 
-            let request = AssertCheckRequest::new(
-                &principal,
-                &consumer,
-                &claim_kind,
-                &target,
-                effect,
-            )?;
+            let request =
+                AssertCheckRequest::new(&principal, &consumer, &claim_kind, &target, effect)?;
 
             // Pull genesis + policy citation from the store so the answer
             // is grounded in the instance's actual authority context.
@@ -1228,6 +1184,8 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
         AssertAction::Grant {
             identity,
             secret,
+            operator_identity,
+            operator_secret,
             claim_kind,
             subject_scope,
             audience,
@@ -1242,24 +1200,20 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
                 (Some(n), false) => Some(n),
                 (None, true) => None,
                 (Some(_), true) => {
-                    return Err("pass either --max-uses N or --unbounded, not both".into())
+                    return Err("pass either --max-uses N or --unbounded, not both".into());
                 }
                 (None, false) => {
                     return Err("assertion leases require a use budget: pass --max-uses N \
                                 (certified sound) or --unbounded (opt into the kind-scope \
                                 laundering surface, L1)"
-                        .into())
+                        .into());
                 }
             };
 
             let mut store = Store::open(db_path)?;
-            // Issuance requires a prior settlement-witness (L4): fail closed.
-            let genesis = store.get_genesis()?.ok_or(
-                "no genesis installed; run `standing genesis install` first \
-                 (assertion issuance requires a settlement-witness)",
-            )?;
-
             let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
+            let (operator, _operator_wid) =
+                resolve_identity(&operator_identity, &operator_secret, None)?;
             let not_before = match not_before {
                 Some(s) => chrono::DateTime::parse_from_rfc3339(&s)
                     .map_err(|e| format!("bad --not-before: {e}"))?
@@ -1280,53 +1234,11 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
                 context: serde_json::json!({}),
             };
 
-            // Root the lease chain at genesis (issuance also cites it as
-            // settlement_witness; this makes the first receipt a parent link).
-            let mut machine = AssertionGrantMachine::request_rooted(&req, Some(&genesis.digest))?;
-            let grant_id = machine.grant_id();
-            let requested = machine.chain.tip().clone();
-            store.record_assertion_transition(
-                grant_id,
-                &machine.state,
-                &requested,
-                Some(AssertionGrantMeta {
-                    actor: principal.id.clone(),
-                    claim_kind: claim_kind.clone(),
-                    subject_scope: subject_scope.clone(),
-                    audience: audience.clone(),
-                    not_before: Some(not_before),
-                    issued_at: None,
-                    expires_at: None,
-                    max_uses,
-                }),
-            )?;
-
-            let policy_hash = genesis.policy_hash.clone().unwrap_or_default();
-            machine.issue(
-                &genesis.digest,
-                &policy_hash,
-                serde_json::json!({ "basis": "operator_issued_under_genesis" }),
-            )?;
-            let issued = machine.chain.tip().clone();
-            let grant = machine.grant.as_ref().unwrap().clone();
-            store.record_assertion_transition(
-                grant_id,
-                &machine.state,
-                &issued,
-                Some(AssertionGrantMeta {
-                    actor: principal.id.clone(),
-                    claim_kind,
-                    subject_scope,
-                    audience,
-                    not_before: Some(grant.not_before),
-                    issued_at: Some(grant.issued_at),
-                    expires_at: Some(grant.expires_at),
-                    max_uses,
-                }),
-            )?;
-
-            println!("assertion lease granted {grant_id}");
+            let created = store.create_assertion_lease(&req, &operator)?;
+            let grant = &created.grant;
+            println!("assertion lease granted {}", created.grant_id);
             println!("  actor: {}", principal.id);
+            println!("  authorized by genesis operator: {}", created.operator_id);
             println!(
                 "  scope: {}:{} @ {}",
                 grant.scope.claim_kind, grant.scope.subject_scope, grant.scope.audience
@@ -1340,8 +1252,8 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
                 Some(n) => println!("  budget: {n} uses (bounded — certified sound)"),
                 None => println!("  budget: UNBOUNDED (kind-scope; NOT certified sound, L1)"),
             }
-            println!("  settlement_witness (genesis): {}", genesis.digest);
-            println!("  receipt: {}", issued.digest);
+            println!("  settlement_witness (genesis): {}", created.genesis_digest);
+            println!("  receipt: {}", created.issued_receipt.digest);
             Ok(())
         }
 
@@ -1432,8 +1344,7 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
         } => {
             let mut store = Store::open(db_path)?;
             let (principal, _wid) = resolve_identity(&identity, &secret, None)?;
-            let grant_id =
-                uuid::Uuid::parse_str(&id).map_err(|e| format!("bad --id: {e}"))?;
+            let grant_id = uuid::Uuid::parse_str(&id).map_err(|e| format!("bad --id: {e}"))?;
             let proof = RequestProof {
                 grant_id,
                 actor: principal.id,
@@ -1479,11 +1390,11 @@ fn handle_assert(db_path: &str, action: AssertAction) -> Result<(), Box<dyn std:
             preview,
         } => {
             let effect = parse_effect(&effect)?;
-            let request = AssertCheckRequest::new(&principal, &consumer, &claim_kind, &target, effect)?;
+            let request =
+                AssertCheckRequest::new(&principal, &consumer, &claim_kind, &target, effect)?;
             let mut store = Store::open(db_path)?;
             let (verified, _wid) = resolve_identity(&identity, &secret, None)?;
-            let grant_id =
-                uuid::Uuid::parse_str(&id).map_err(|e| format!("bad --id: {e}"))?;
+            let grant_id = uuid::Uuid::parse_str(&id).map_err(|e| format!("bad --id: {e}"))?;
             let proof = RequestProof {
                 grant_id,
                 actor: verified.id,
@@ -1517,9 +1428,9 @@ fn handle_policy(db_path: &str, action: PolicyAction) -> Result<(), Box<dyn std:
             identity,
             secret,
         } => {
-            if !["claim_kind", "actor", "audience"].contains(&class_type.as_str()) {
+            if !["claim_kind", "action", "actor", "audience"].contains(&class_type.as_str()) {
                 return Err(format!(
-                    "unknown --class-type {class_type:?} (expected: claim_kind | actor | audience)"
+                    "unknown --class-type {class_type:?} (expected: claim_kind | action | actor | audience)"
                 )
                 .into());
             }
@@ -1534,8 +1445,14 @@ fn handle_policy(db_path: &str, action: PolicyAction) -> Result<(), Box<dyn std:
                 None => None,
             };
             let r = store.install_freeze(
-                &handle, &class_type, &class_value, audience.as_deref(), &reason, until,
-                &op.id, chrono::Utc::now(),
+                &handle,
+                &class_type,
+                &class_value,
+                audience.as_deref(),
+                &reason,
+                until,
+                &op.id,
+                chrono::Utc::now(),
             )?;
             println!("frozen {handle}");
             println!("  class: {class_type}={class_value}");
@@ -1546,7 +1463,11 @@ fn handle_policy(db_path: &str, action: PolicyAction) -> Result<(), Box<dyn std:
             println!("  receipt: {}", r.digest);
             Ok(())
         }
-        PolicyAction::Thaw { handle, identity, secret } => {
+        PolicyAction::Thaw {
+            handle,
+            identity,
+            secret,
+        } => {
             let mut store = Store::open(db_path)?;
             let (op, _wid) = resolve_identity(&identity, &secret, None)?;
             let r = store.thaw_freeze(&handle, &op.id, chrono::Utc::now())?;

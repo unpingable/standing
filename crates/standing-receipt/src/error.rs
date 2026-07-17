@@ -8,6 +8,9 @@ pub enum ReceiptError {
     #[error("receipt chain broken: expected parent {expected}, got {actual}")]
     ChainBroken { expected: String, actual: String },
 
+    #[error("receipt subject mismatch: expected {expected}, got {actual}")]
+    SubjectMismatch { expected: String, actual: String },
+
     #[error("receipt chain is empty")]
     EmptyChain,
 

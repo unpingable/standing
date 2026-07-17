@@ -2,6 +2,8 @@
 
 use std::process::Command;
 
+const BODY_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 fn standing() -> Command {
     Command::new(env!("CARGO_BIN_EXE_standing"))
 }
@@ -12,10 +14,23 @@ fn temp_db() -> tempfile::NamedTempFile {
 
 fn temp_identity(name: &str, location: &str, secret: &str) -> tempfile::NamedTempFile {
     let output = standing()
-        .args(["identity", "create", "--name", name, "--location", location, "--secret", secret])
+        .args([
+            "identity",
+            "create",
+            "--name",
+            name,
+            "--location",
+            location,
+            "--secret",
+            secret,
+        ])
         .output()
         .unwrap();
-    assert!(output.status.success(), "identity create failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "identity create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let mut f = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut f, &output.stdout).unwrap();
@@ -53,8 +68,14 @@ const SECRET: &str = "integration-test-secret";
 fn identity_create_and_verify() {
     let id_file = temp_identity("test-bot", "host-1", SECRET);
 
-    let (ok, stdout, _) = run(standing()
-        .args(["identity", "verify", "--identity", id_file.path().to_str().unwrap(), "--secret", SECRET]));
+    let (ok, stdout, _) = run(standing().args([
+        "identity",
+        "verify",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+    ]));
     assert!(ok);
     assert!(stdout.contains("wl:test-bot:host-1"));
 }
@@ -63,8 +84,14 @@ fn identity_create_and_verify() {
 fn identity_verify_wrong_secret_fails() {
     let id_file = temp_identity("test-bot", "host-1", SECRET);
 
-    let (ok, _, stderr) = run(standing()
-        .args(["identity", "verify", "--identity", id_file.path().to_str().unwrap(), "--secret", "wrong"]));
+    let (ok, _, stderr) = run(standing().args([
+        "identity",
+        "verify",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        "wrong",
+    ]));
     assert!(!ok);
     assert!(stderr.contains("verification failed"));
 }
@@ -72,12 +99,20 @@ fn identity_verify_wrong_secret_fails() {
 #[test]
 fn identity_missing_file_fails() {
     let db = temp_db();
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db.path().to_str().unwrap(),
-               "grant", "request",
-               "--identity", "/tmp/nonexistent-standing-id.json",
-               "--secret", SECRET,
-               "--action", "deploy", "--target", "prod"]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db.path().to_str().unwrap(),
+        "grant",
+        "request",
+        "--identity",
+        "/tmp/nonexistent-standing-id.json",
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+    ]));
     assert!(!ok);
     assert!(stderr.contains("cannot read identity file"));
 }
@@ -94,33 +129,67 @@ fn full_lifecycle_happy_path() {
     let id_path = id_file.path().to_str().unwrap();
 
     // Request
-    let (ok, stdout, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod/web-api", "--duration", "300"]));
+    let (ok, stdout, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod/web-api",
+        "--duration",
+        "300",
+    ]));
     assert!(ok, "request failed: {stderr}");
     assert!(stdout.contains("granted"));
     let grant_id = extract_grant_id(&stdout);
 
     // Activate
-    let (ok, stdout, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "activate",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET]));
+    let (ok, stdout, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "activate",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+    ]));
     assert!(ok, "activate failed: {stderr}");
     assert!(stdout.contains("activated"));
 
     // Use
-    let (ok, stdout, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "use",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod/web-api",
-               "--evidence", r#"{"deployed":"v1.0"}"#]));
+    let (ok, stdout, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod/web-api",
+        "--evidence",
+        r#"{"deployed":"v1.0"}"#,
+    ]));
     assert!(ok, "use failed: {stderr}");
     assert!(stdout.contains("used"));
 
     // Query chain
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "query", "chain", "--id", &grant_id]));
+    let (ok, stdout, _) =
+        run(standing().args(["--db", db_path, "query", "chain", "--id", &grant_id]));
     assert!(ok);
     assert!(stdout.contains("grant_requested"));
     assert!(stdout.contains("grant_issued"));
@@ -128,8 +197,8 @@ fn full_lifecycle_happy_path() {
     assert!(stdout.contains("grant_used"));
 
     // Query why
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "query", "why", "--id", &grant_id]));
+    let (ok, stdout, _) =
+        run(standing().args(["--db", db_path, "query", "why", "--id", &grant_id]));
     assert!(ok);
     assert!(stdout.contains("verdict"));
     assert!(stdout.contains("allow"));
@@ -147,10 +216,22 @@ fn policy_denies_excessive_duration() {
     let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
     let id_path = id_file.path().to_str().unwrap();
 
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "7200"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "7200",
+    ]));
     assert!(ok); // CLI exits 0 even on deny — it's a valid outcome
     assert!(stdout.contains("denied"));
     assert!(stdout.contains("exceeds max"));
@@ -168,18 +249,38 @@ fn wrong_principal_cannot_activate() {
     let bot2 = temp_identity("bot-2", "host-b", SECRET);
 
     // Request as bot-1
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", bot1.path().to_str().unwrap(), "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        bot1.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
+    ]));
     assert!(ok);
     let grant_id = extract_grant_id(&stdout);
 
     // Try to activate as bot-2 — should fail
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "activate",
-               "--id", &grant_id,
-               "--identity", bot2.path().to_str().unwrap(), "--secret", SECRET]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "activate",
+        "--id",
+        &grant_id,
+        "--identity",
+        bot2.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+    ]));
     assert!(!ok);
     assert!(stderr.contains("unauthorized"));
 }
@@ -195,31 +296,76 @@ fn double_use_rejected() {
     let id_file = temp_identity("bot", "host", SECRET);
     let id_path = id_file.path().to_str().unwrap();
 
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
+    ]));
     assert!(ok);
     let grant_id = extract_grant_id(&stdout);
 
     // Activate
-    let (ok, _, _) = run(standing()
-        .args(["--db", db_path, "grant", "activate",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET]));
+    let (ok, _, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "activate",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+    ]));
     assert!(ok);
 
     // Use
-    let (ok, _, _) = run(standing()
-        .args(["--db", db_path, "grant", "use",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod"]));
+    let (ok, _, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+    ]));
     assert!(ok);
 
     // Second use — should fail
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "use",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod"]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+    ]));
     assert!(!ok);
     assert!(stderr.contains("invalid transition"));
 }
@@ -236,30 +382,75 @@ fn use_with_wrong_scope_is_refused_and_does_not_consume() {
     let id_path = id_file.path().to_str().unwrap();
 
     // Grant scoped to deploy/prod.
-    let (ok, stdout, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    let (ok, stdout, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
+    ]));
     assert!(ok, "request failed: {stderr}");
     let grant_id = extract_grant_id(&stdout);
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "activate",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "activate",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+    ]));
     assert!(ok, "activate failed: {stderr}");
 
     // Use with the WRONG target → refused with scope mismatch.
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "use",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "staging"]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "staging",
+    ]));
     assert!(!ok, "wrong-scope use must be refused");
     assert!(stderr.contains("scope mismatch"), "stderr: {stderr}");
 
     // Non-consuming: the correctly-scoped use still succeeds (grant not burned).
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "use",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod"]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+    ]));
     assert!(ok, "grant must be unspent after a scope mismatch: {stderr}");
 }
 
@@ -272,14 +463,34 @@ fn activated_grant(db: &tempfile::NamedTempFile, id_file: &tempfile::NamedTempFi
     let db_path = db.path().to_str().unwrap();
     let id_path = id_file.path().to_str().unwrap();
     let (ok, stdout, stderr) = run(standing().args([
-        "--db", db_path, "grant", "request", "--identity", id_path, "--secret", SECRET,
-        "--action", "deploy", "--target", "prod", "--duration", "300",
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
     ]));
     assert!(ok, "request failed: {stderr}");
     let grant_id = extract_grant_id(&stdout);
     let (ok, _, stderr) = run(standing().args([
-        "--db", db_path, "grant", "activate", "--id", &grant_id, "--identity", id_path,
-        "--secret", SECRET,
+        "--db",
+        db_path,
+        "grant",
+        "activate",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
     ]));
     assert!(ok, "activate failed: {stderr}");
     grant_id
@@ -291,15 +502,36 @@ fn grant_use_json_success_packet() {
     let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
     let grant_id = activated_grant(&db, &id_file);
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(), "grant", "use", "--id", &grant_id,
-        "--identity", id_file.path().to_str().unwrap(), "--secret", SECRET,
-        "--action", "deploy", "--target", "prod", "--json",
+        "--db",
+        db.path().to_str().unwrap(),
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--json",
     ]));
     assert!(ok);
-    assert!(stdout.contains(r#""schema":"standing.grant_use.v1""#), "{stdout}");
+    assert!(
+        stdout.contains(r#""schema":"standing.grant_use.v1""#),
+        "{stdout}"
+    );
     assert!(stdout.contains(r#""result":"used""#), "{stdout}");
-    assert!(stdout.contains(r#""receipt_kind":"grant_used""#), "{stdout}");
-    assert!(stdout.contains(r#""receipt_digest":""#), "digest required on used: {stdout}");
+    assert!(
+        stdout.contains(r#""receipt_kind":"grant_used""#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""receipt_digest":""#),
+        "digest required on used: {stdout}"
+    );
 }
 
 #[test]
@@ -308,14 +540,32 @@ fn grant_use_json_scope_mismatch_refusal() {
     let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
     let grant_id = activated_grant(&db, &id_file);
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(), "grant", "use", "--id", &grant_id,
-        "--identity", id_file.path().to_str().unwrap(), "--secret", SECRET,
-        "--action", "deploy", "--target", "staging", "--json",
+        "--db",
+        db.path().to_str().unwrap(),
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "staging",
+        "--json",
     ]));
     assert!(!ok, "wrong scope must exit nonzero");
     assert!(stdout.contains(r#""result":"refused""#), "{stdout}");
-    assert!(stdout.contains(r#""refusal_class":"scope_mismatch""#), "{stdout}");
-    assert!(stdout.contains(r#""receipt_digest":null"#), "refusal digest must be null: {stdout}");
+    assert!(
+        stdout.contains(r#""refusal_class":"scope_mismatch""#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""receipt_digest":null"#),
+        "refusal digest must be null: {stdout}"
+    );
 }
 
 #[test]
@@ -324,13 +574,27 @@ fn grant_use_json_not_found_refusal() {
     let id_file = temp_identity("deploy-bot", "host-abc", SECRET);
     // A syntactically valid but nonexistent grant id.
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(), "grant", "use",
-        "--id", "00000000-0000-0000-0000-000000000000",
-        "--identity", id_file.path().to_str().unwrap(), "--secret", SECRET,
-        "--action", "deploy", "--target", "prod", "--json",
+        "--db",
+        db.path().to_str().unwrap(),
+        "grant",
+        "use",
+        "--id",
+        "00000000-0000-0000-0000-000000000000",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--json",
     ]));
     assert!(!ok);
-    assert!(stdout.contains(r#""refusal_class":"not_found""#), "{stdout}");
+    assert!(
+        stdout.contains(r#""refusal_class":"not_found""#),
+        "{stdout}"
+    );
     assert!(stdout.contains(r#""receipt_digest":null"#), "{stdout}");
 }
 
@@ -342,12 +606,27 @@ fn grant_use_json_subject_mismatch_refusal() {
     // A different principal attempts to use the grant.
     let other = temp_identity("evil-bot", "host-xyz", SECRET);
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(), "grant", "use", "--id", &grant_id,
-        "--identity", other.path().to_str().unwrap(), "--secret", SECRET,
-        "--action", "deploy", "--target", "prod", "--json",
+        "--db",
+        db.path().to_str().unwrap(),
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        other.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--json",
     ]));
     assert!(!ok);
-    assert!(stdout.contains(r#""refusal_class":"subject_mismatch""#), "{stdout}");
+    assert!(
+        stdout.contains(r#""refusal_class":"subject_mismatch""#),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -359,17 +638,46 @@ fn grant_use_json_already_spent_refusal() {
     let id_path = id_file.path().to_str().unwrap();
     // First (valid) spend.
     let (ok, _, _) = run(standing().args([
-        "--db", db_path, "grant", "use", "--id", &grant_id, "--identity", id_path,
-        "--secret", SECRET, "--action", "deploy", "--target", "prod", "--json",
+        "--db",
+        db_path,
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--json",
     ]));
     assert!(ok);
     // Second spend → already_spent.
     let (ok, stdout, _) = run(standing().args([
-        "--db", db_path, "grant", "use", "--id", &grant_id, "--identity", id_path,
-        "--secret", SECRET, "--action", "deploy", "--target", "prod", "--json",
+        "--db",
+        db_path,
+        "grant",
+        "use",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--json",
     ]));
     assert!(!ok);
-    assert!(stdout.contains(r#""refusal_class":"already_spent""#), "{stdout}");
+    assert!(
+        stdout.contains(r#""refusal_class":"already_spent""#),
+        "{stdout}"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -383,25 +691,57 @@ fn admin_revoke_then_activate_fails() {
     let id_file = temp_identity("bot", "host", SECRET);
     let id_path = id_file.path().to_str().unwrap();
 
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
+    ]));
     assert!(ok);
     let grant_id = extract_grant_id(&stdout);
 
     // Revoke as admin
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "revoke",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET,
-               "--admin", "--reason", "security"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "revoke",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--admin",
+        "--reason",
+        "security",
+    ]));
     assert!(ok);
     assert!(stdout.contains("revoked"));
 
     // Try to activate — should fail
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "activate",
-               "--id", &grant_id, "--identity", id_path, "--secret", SECRET]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "activate",
+        "--id",
+        &grant_id,
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+    ]));
     assert!(!ok);
     assert!(stderr.contains("invalid transition"));
 }
@@ -418,10 +758,22 @@ fn sweep_expires_stale_grants() {
     let id_path = id_file.path().to_str().unwrap();
 
     // Request with 1-second duration
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "1"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "1",
+    ]));
     assert!(ok);
     let grant_id = extract_grant_id(&stdout);
 
@@ -429,21 +781,19 @@ fn sweep_expires_stale_grants() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Dry run
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "sweep", "--dry-run"]));
+    let (ok, stdout, _) = run(standing().args(["--db", db_path, "grant", "sweep", "--dry-run"]));
     assert!(ok);
     assert!(stdout.contains("would expire"));
 
     // Real sweep
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "sweep"]));
+    let (ok, stdout, _) = run(standing().args(["--db", db_path, "grant", "sweep"]));
     assert!(ok);
     assert!(stdout.contains("expired"));
     assert!(stdout.contains(&grant_id));
 
     // Verify state
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "list", "--state", "expired"]));
+    let (ok, stdout, _) =
+        run(standing().args(["--db", db_path, "grant", "list", "--state", "expired"]));
     assert!(ok);
     assert!(stdout.contains(&grant_id));
 }
@@ -460,21 +810,31 @@ fn list_grants_shows_entries() {
     let id_path = id_file.path().to_str().unwrap();
 
     // Empty
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "list"]));
+    let (ok, stdout, _) = run(standing().args(["--db", db_path, "grant", "list"]));
     assert!(ok);
     assert!(stdout.contains("no grants found"));
 
     // Create one
-    let (ok, _, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    let (ok, _, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
+    ]));
     assert!(ok);
 
     // Now has one
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "list"]));
+    let (ok, stdout, _) = run(standing().args(["--db", db_path, "grant", "list"]));
     assert!(ok);
     assert!(stdout.contains("deploy"));
     assert!(stdout.contains("wl:bot:host"));
@@ -492,18 +852,42 @@ fn replay_same_identity_on_grant_request_rejected() {
     let id_path = id_file.path().to_str().unwrap();
 
     // First request succeeds
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
+    ]));
     assert!(ok);
     assert!(stdout.contains("granted"));
 
     // Second request with SAME identity file (same jti) should be rejected
-    let (ok, _, stderr) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id_path, "--secret", SECRET,
-               "--action", "deploy", "--target", "staging", "--duration", "300"]));
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id_path,
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "staging",
+        "--duration",
+        "300",
+    ]));
     assert!(!ok);
     assert!(stderr.contains("ReplayDetected") || stderr.contains("replay"));
 }
@@ -516,17 +900,41 @@ fn fresh_identity_after_replay_works() {
     let id2 = temp_identity("bot", "host", SECRET);
 
     // First request with id1
-    let (ok, _, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id1.path().to_str().unwrap(), "--secret", SECRET,
-               "--action", "deploy", "--target", "prod", "--duration", "300"]));
+    let (ok, _, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id1.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "prod",
+        "--duration",
+        "300",
+    ]));
     assert!(ok);
 
     // Second request with id2 (different jti) succeeds
-    let (ok, stdout, _) = run(standing()
-        .args(["--db", db_path, "grant", "request",
-               "--identity", id2.path().to_str().unwrap(), "--secret", SECRET,
-               "--action", "deploy", "--target", "staging", "--duration", "300"]));
+    let (ok, stdout, _) = run(standing().args([
+        "--db",
+        db_path,
+        "grant",
+        "request",
+        "--identity",
+        id2.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--action",
+        "deploy",
+        "--target",
+        "staging",
+        "--duration",
+        "300",
+    ]));
     assert!(ok);
     assert!(stdout.contains("granted"));
 }
@@ -551,15 +959,20 @@ fn parse_decision(stdout: &str) -> serde_json::Value {
 }
 
 #[test]
-fn resolver_list_modes_documents_all_four() {
+fn resolver_list_modes_matches_test_surface() {
     let (ok, stdout, _) = run(standing().args(["resolver", "list-modes"]));
     assert!(ok);
-    for mode in ["deny_all", "local_only", "static_config", "store_grant"] {
+    for mode in ["deny_all", "local_only", "static_config"] {
         assert!(
             stdout.contains(mode),
             "resolver list-modes must mention {mode}: {stdout}"
         );
     }
+    assert!(
+        !stdout.contains("store_grant"),
+        "unsupported mode must not be listed: {stdout}"
+    );
+    assert!(stdout.contains("standing assert resolve"));
 }
 
 #[test]
@@ -862,12 +1275,8 @@ fn genesis_install_then_show_returns_receipt() {
     assert!(stdout.contains("operator_fiat"));
     assert!(stdout.contains("wl:jbeck:laptop"));
 
-    let (ok, stdout, _) = run(standing().args([
-        "--db",
-        db.path().to_str().unwrap(),
-        "genesis",
-        "show",
-    ]));
+    let (ok, stdout, _) =
+        run(standing().args(["--db", db.path().to_str().unwrap(), "genesis", "show"]));
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(v["kind"], "genesis_install");
@@ -917,12 +1326,8 @@ fn second_genesis_install_is_refused() {
 #[test]
 fn genesis_show_before_install_reports_absence() {
     let db = temp_db();
-    let (ok, stdout, _) = run(standing().args([
-        "--db",
-        db.path().to_str().unwrap(),
-        "genesis",
-        "show",
-    ]));
+    let (ok, stdout, _) =
+        run(standing().args(["--db", db.path().to_str().unwrap(), "genesis", "show"]));
     assert!(ok);
     assert!(stdout.contains("no genesis receipt installed"));
 }
@@ -1026,13 +1431,20 @@ fn query_why_footers_silence_when_no_genesis() {
 fn assert_check_descriptive_does_not_require() {
     let db = temp_db();
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nq:linode",
-        "--consumer", "nq:linode",
-        "--claim-kind", "sqlite_wal_state",
-        "--target", "labelwatch/foo",
-        "--effect", "descriptive",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nq:linode",
+        "--consumer",
+        "nq:linode",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--target",
+        "labelwatch/foo",
+        "--effect",
+        "descriptive",
     ]));
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1049,13 +1461,20 @@ fn assert_check_descriptive_does_not_require() {
 fn assert_check_advisory_does_not_require() {
     let db = temp_db();
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nq:linode",
-        "--consumer", "wicket:local",
-        "--claim-kind", "host_state",
-        "--target", "host:storage01",
-        "--effect", "advisory",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nq:linode",
+        "--consumer",
+        "wicket:local",
+        "--claim-kind",
+        "host_state",
+        "--target",
+        "host:storage01",
+        "--effect",
+        "advisory",
     ]));
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1067,13 +1486,20 @@ fn assert_check_advisory_does_not_require() {
 fn assert_check_binding_refused_as_not_implemented() {
     let db = temp_db();
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nq:linode",
-        "--consumer", "wicket:local",
-        "--claim-kind", "deploy_authorization",
-        "--target", "prod/web-api",
-        "--effect", "binding",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nq:linode",
+        "--consumer",
+        "wicket:local",
+        "--claim-kind",
+        "deploy_authorization",
+        "--target",
+        "prod/web-api",
+        "--effect",
+        "binding",
     ]));
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1088,13 +1514,20 @@ fn assert_check_binding_refused_as_not_implemented() {
 fn assert_check_mutating_refused_as_not_implemented() {
     let db = temp_db();
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nightshift:sushi-k",
-        "--consumer", "ag:local",
-        "--claim-kind", "watchbill_close",
-        "--target", "wb-42",
-        "--effect", "mutating",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nightshift:sushi-k",
+        "--consumer",
+        "ag:local",
+        "--claim-kind",
+        "watchbill_close",
+        "--target",
+        "wb-42",
+        "--effect",
+        "mutating",
     ]));
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1109,22 +1542,33 @@ fn assert_check_cites_genesis_when_installed() {
 
     // Install genesis first.
     let (ok, _, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "genesis", "install",
-        "--identity", id_file.path().to_str().unwrap(),
-        "--secret", SECRET,
+        "--db",
+        db.path().to_str().unwrap(),
+        "genesis",
+        "install",
+        "--identity",
+        id_file.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
     ]));
     assert!(ok);
 
     // Now check assert; result should cite genesis digest + policy hash.
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nq:linode",
-        "--consumer", "wicket:local",
-        "--claim-kind", "deploy",
-        "--target", "prod/web-api",
-        "--effect", "binding",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nq:linode",
+        "--consumer",
+        "wicket:local",
+        "--claim-kind",
+        "deploy",
+        "--target",
+        "prod/web-api",
+        "--effect",
+        "binding",
     ]));
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1142,13 +1586,20 @@ fn assert_check_cites_genesis_when_installed() {
 fn assert_check_silent_when_no_genesis() {
     let db = temp_db();
     let (ok, stdout, _) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nq:linode",
-        "--consumer", "wicket:local",
-        "--claim-kind", "deploy",
-        "--target", "prod/web-api",
-        "--effect", "binding",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nq:linode",
+        "--consumer",
+        "wicket:local",
+        "--claim-kind",
+        "deploy",
+        "--target",
+        "prod/web-api",
+        "--effect",
+        "binding",
     ]));
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1164,13 +1615,20 @@ fn assert_check_silent_when_no_genesis() {
 fn assert_check_rejects_bare_consumer_name() {
     let db = temp_db();
     let (ok, _, stderr) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nq:linode",
-        "--consumer", "nq",
-        "--claim-kind", "sqlite_wal_state",
-        "--target", "labelwatch/foo",
-        "--effect", "descriptive",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nq:linode",
+        "--consumer",
+        "nq",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--target",
+        "labelwatch/foo",
+        "--effect",
+        "descriptive",
     ]));
     assert!(!ok, "bare consumer name must be refused");
     assert!(
@@ -1183,13 +1641,20 @@ fn assert_check_rejects_bare_consumer_name() {
 fn assert_check_rejects_unknown_effect() {
     let db = temp_db();
     let (ok, _, stderr) = run(standing().args([
-        "--db", db.path().to_str().unwrap(),
-        "assert", "check",
-        "--principal", "component:nq:linode",
-        "--consumer", "nq:linode",
-        "--claim-kind", "sqlite_wal_state",
-        "--target", "labelwatch/foo",
-        "--effect", "binding-ish",
+        "--db",
+        db.path().to_str().unwrap(),
+        "assert",
+        "check",
+        "--principal",
+        "component:nq:linode",
+        "--consumer",
+        "nq:linode",
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--target",
+        "labelwatch/foo",
+        "--effect",
+        "binding-ish",
     ]));
     assert!(!ok);
     assert!(stderr.contains("unknown effect"), "stderr was: {stderr}");
@@ -1201,7 +1666,14 @@ fn assert_check_rejects_unknown_effect() {
 
 fn install_genesis(db: &str, op: &str) {
     let (ok, _o, e) = run(standing().args([
-        "--db", db, "genesis", "install", "--identity", op, "--secret", SECRET,
+        "--db",
+        db,
+        "genesis",
+        "install",
+        "--identity",
+        op,
+        "--secret",
+        SECRET,
     ]));
     assert!(ok, "genesis install failed: {e}");
 }
@@ -1210,16 +1682,36 @@ fn install_genesis(db: &str, op: &str) {
 fn assert_grant_requires_genesis() {
     let db = temp_db();
     let dbp = db.path().to_str().unwrap();
+    let op = temp_identity("operator", "laptop", SECRET);
     let speaker = temp_identity("speaker", "host1", SECRET);
     // No genesis installed yet — issuance must fail closed (L4).
     let (ok, _o, e) = run(standing().args([
-        "--db", dbp, "assert", "grant",
-        "--identity", speaker.path().to_str().unwrap(), "--secret", SECRET,
-        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
-        "--audience", "nq:main", "--max-uses", "2",
+        "--db",
+        dbp,
+        "assert",
+        "grant",
+        "--identity",
+        speaker.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--operator-identity",
+        op.path().to_str().unwrap(),
+        "--operator-secret",
+        SECRET,
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/*",
+        "--audience",
+        "nq:main",
+        "--max-uses",
+        "2",
     ]));
     assert!(!ok);
-    assert!(e.contains("no genesis"), "expected genesis fail-closed, got: {e}");
+    assert!(
+        e.contains("no genesis"),
+        "expected genesis fail-closed, got: {e}"
+    );
 }
 
 #[test]
@@ -1227,17 +1719,92 @@ fn assert_grant_requires_a_budget_choice() {
     let db = temp_db();
     let dbp = db.path().to_str().unwrap();
     let op = temp_identity("operator", "laptop", SECRET);
-    install_genesis(dbp, op.path().to_str().unwrap());
+    let opp = op.path().to_str().unwrap();
+    install_genesis(dbp, opp);
     let speaker = temp_identity("speaker", "host1", SECRET);
     // Neither --max-uses nor --unbounded → refused (L1: must choose).
     let (ok, _o, e) = run(standing().args([
-        "--db", dbp, "assert", "grant",
-        "--identity", speaker.path().to_str().unwrap(), "--secret", SECRET,
-        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
-        "--audience", "nq:main",
+        "--db",
+        dbp,
+        "assert",
+        "grant",
+        "--identity",
+        speaker.path().to_str().unwrap(),
+        "--secret",
+        SECRET,
+        "--operator-identity",
+        opp,
+        "--operator-secret",
+        SECRET,
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/*",
+        "--audience",
+        "nq:main",
     ]));
     assert!(!ok);
-    assert!(e.contains("use budget"), "expected budget-required refusal, got: {e}");
+    assert!(
+        e.contains("use budget"),
+        "expected budget-required refusal, got: {e}"
+    );
+}
+
+#[test]
+fn assert_grant_requires_genesis_operator_and_refuses_self_grant() {
+    let db = temp_db();
+    let dbp = db.path().to_str().unwrap();
+    let op = temp_identity("operator", "laptop", SECRET);
+    let opp = op.path().to_str().unwrap();
+    install_genesis(dbp, opp);
+    let speaker = temp_identity("speaker", "host1", SECRET);
+    let sp = speaker.path().to_str().unwrap();
+    let impostor = temp_identity("impostor", "laptop", SECRET);
+    let ip = impostor.path().to_str().unwrap();
+
+    let grant = |actor: &str, authorizer: &str| {
+        run(standing().args([
+            "--db",
+            dbp,
+            "assert",
+            "grant",
+            "--identity",
+            actor,
+            "--secret",
+            SECRET,
+            "--operator-identity",
+            authorizer,
+            "--operator-secret",
+            SECRET,
+            "--claim-kind",
+            "sqlite_wal_state",
+            "--subject-scope",
+            "labelwatch/*",
+            "--audience",
+            "nq:main",
+            "--max-uses",
+            "2",
+        ]))
+    };
+
+    let (ok, _, e) = grant(sp, ip);
+    assert!(!ok);
+    assert!(
+        e.contains("requires genesis operator wl:operator:laptop"),
+        "{e}"
+    );
+
+    let (ok, _, e) = grant(opp, opp);
+    assert!(!ok);
+    assert!(e.contains("cannot authorize its own lease"), "{e}");
+
+    let (ok, out, e) = run(standing().args(["--db", dbp, "assert", "list"]));
+    assert!(ok, "assert list failed: {e}");
+    assert_eq!(
+        out.trim(),
+        "[]",
+        "refused issuance must write no lease: {out}"
+    );
 }
 
 #[test]
@@ -1245,23 +1812,64 @@ fn assert_lease_spend_reuse_replay_and_exhaustion() {
     let db = temp_db();
     let dbp = db.path().to_str().unwrap();
     let op = temp_identity("operator", "laptop", SECRET);
-    install_genesis(dbp, op.path().to_str().unwrap());
+    let opp = op.path().to_str().unwrap();
+    install_genesis(dbp, opp);
     let speaker = temp_identity("speaker", "host1", SECRET);
     let sp = speaker.path().to_str().unwrap();
 
     let (ok, out, e) = run(standing().args([
-        "--db", dbp, "assert", "grant", "--identity", sp, "--secret", SECRET,
-        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
-        "--audience", "nq:main", "--max-uses", "2",
+        "--db",
+        dbp,
+        "assert",
+        "grant",
+        "--identity",
+        sp,
+        "--secret",
+        SECRET,
+        "--operator-identity",
+        opp,
+        "--operator-secret",
+        SECRET,
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/*",
+        "--audience",
+        "nq:main",
+        "--max-uses",
+        "2",
     ]));
     assert!(ok, "grant failed: {e}");
+    assert!(out.contains("authorized by genesis operator: wl:operator:laptop"));
     let gid = extract_grant_id(&out.lines().next().unwrap().replace("assertion lease", ""));
+
+    let (ok, chain, e) = run(standing().args(["--db", dbp, "query", "chain", "--id", &gid]));
+    assert!(ok, "query chain failed: {e}");
+    assert!(
+        chain.contains(r#""operator_id": "wl:operator:laptop""#),
+        "{chain}"
+    );
 
     let prove = |jti: &str, subject: &str| {
         run(standing().args([
-            "--db", dbp, "assert", "prove", "--id", &gid, "--identity", sp, "--secret", SECRET,
-            "--claim-kind", "sqlite_wal_state", "--subject-id", subject, "--audience", "nq:main",
-            "--jti", jti,
+            "--db",
+            dbp,
+            "assert",
+            "prove",
+            "--id",
+            &gid,
+            "--identity",
+            sp,
+            "--secret",
+            SECRET,
+            "--claim-kind",
+            "sqlite_wal_state",
+            "--subject-id",
+            subject,
+            "--audience",
+            "nq:main",
+            "--jti",
+            jti,
         ]))
     };
 
@@ -1283,7 +1891,10 @@ fn assert_lease_spend_reuse_replay_and_exhaustion() {
     // Spend #2 exhausts the budget of 2.
     let (ok, out, _) = prove("j2", "labelwatch/bar");
     assert!(ok);
-    assert!(out.contains("EXHAUSTED"), "expected exhaustion notice, got: {out}");
+    assert!(
+        out.contains("EXHAUSTED"),
+        "expected exhaustion notice, got: {out}"
+    );
 
     // Spend #3 refused — budget spent.
     let (ok, _o, e) = prove("j3", "labelwatch/baz");
@@ -1296,24 +1907,63 @@ fn resolve_preview_authorizes_nothing_spend_authorizes() {
     let db = temp_db();
     let dbp = db.path().to_str().unwrap();
     let op = temp_identity("operator", "laptop", SECRET);
-    install_genesis(dbp, op.path().to_str().unwrap());
+    let opp = op.path().to_str().unwrap();
+    install_genesis(dbp, opp);
     let speaker = temp_identity("speaker", "host1", SECRET);
     let sp = speaker.path().to_str().unwrap();
 
     let (_ok, out, _e) = run(standing().args([
-        "--db", dbp, "assert", "grant", "--identity", sp, "--secret", SECRET,
-        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
-        "--audience", "nq:main", "--max-uses", "5",
+        "--db",
+        dbp,
+        "assert",
+        "grant",
+        "--identity",
+        sp,
+        "--secret",
+        SECRET,
+        "--operator-identity",
+        opp,
+        "--operator-secret",
+        SECRET,
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/*",
+        "--audience",
+        "nq:main",
+        "--max-uses",
+        "5",
     ]));
     let gid = extract_grant_id(&out.lines().next().unwrap().replace("assertion lease", ""));
 
     let resolve = |jti: &str, extra: &[&str]| {
         let mut args = vec![
-            "--db", dbp, "assert", "resolve",
-            "--principal", "wl:speaker:host1", "--consumer", "nq:main",
-            "--claim-kind", "sqlite_wal_state", "--target", "labelwatch/foo", "--effect", "binding",
-            "--id", &gid, "--identity", sp, "--secret", SECRET,
-            "--subject-id", "labelwatch/foo", "--jti", jti,
+            "--db",
+            dbp,
+            "assert",
+            "resolve",
+            "--principal",
+            "wl:speaker:host1",
+            "--consumer",
+            "nq:main",
+            "--claim-kind",
+            "sqlite_wal_state",
+            "--target",
+            "labelwatch/foo",
+            "--effect",
+            "binding",
+            "--id",
+            &gid,
+            "--identity",
+            sp,
+            "--secret",
+            SECRET,
+            "--subject-id",
+            "labelwatch/foo",
+            "--jti",
+            jti,
+            "--body-digest",
+            BODY_DIGEST,
         ];
         args.extend_from_slice(extra);
         run(standing().args(&args))
@@ -1323,13 +1973,19 @@ fn resolve_preview_authorizes_nothing_spend_authorizes() {
     let (ok, out, _) = resolve("rp1", &["--preview"]);
     assert!(ok);
     assert!(out.contains("\"required_and_available\""));
-    assert!(out.contains("\"authorizes_effect\": false"), "preview must not authorize: {out}");
+    assert!(
+        out.contains("\"authorizes_effect\": false"),
+        "preview must not authorize: {out}"
+    );
     assert!(out.contains("\"preview\""));
 
     // Spend: authorizes_effect=true, emits a receipt digest.
     let (ok, out, _) = resolve("rp2", &[]);
     assert!(ok);
-    assert!(out.contains("\"authorizes_effect\": true"), "spend must authorize: {out}");
+    assert!(
+        out.contains("\"authorizes_effect\": true"),
+        "spend must authorize: {out}"
+    );
     assert!(out.contains("emitted_receipt_digest"));
     assert!(out.contains("within_validity"));
 }
@@ -1343,44 +1999,173 @@ fn policy_freeze_denies_then_thaw_restores() {
     install_genesis(dbp, opp);
     let speaker = temp_identity("speaker", "host1", SECRET);
     let sp = speaker.path().to_str().unwrap();
+    let impostor = temp_identity("impostor", "laptop", SECRET);
+    let ip = impostor.path().to_str().unwrap();
 
     let (_ok, out, _) = run(standing().args([
-        "--db", dbp, "assert", "grant", "--identity", sp, "--secret", SECRET,
-        "--claim-kind", "sqlite_wal_state", "--subject-scope", "labelwatch/*",
-        "--audience", "nq:main", "--max-uses", "5",
+        "--db",
+        dbp,
+        "assert",
+        "grant",
+        "--identity",
+        sp,
+        "--secret",
+        SECRET,
+        "--operator-identity",
+        opp,
+        "--operator-secret",
+        SECRET,
+        "--claim-kind",
+        "sqlite_wal_state",
+        "--subject-scope",
+        "labelwatch/*",
+        "--audience",
+        "nq:main",
+        "--max-uses",
+        "5",
     ]));
     let gid = extract_grant_id(&out.lines().next().unwrap().replace("assertion lease", ""));
 
-    let prove = |jti: &str| run(standing().args([
-        "--db", dbp, "assert", "prove", "--id", &gid, "--identity", sp, "--secret", SECRET,
-        "--claim-kind", "sqlite_wal_state", "--subject-id", "labelwatch/foo",
-        "--audience", "nq:main", "--jti", jti,
+    let prove = |jti: &str| {
+        run(standing().args([
+            "--db",
+            dbp,
+            "assert",
+            "prove",
+            "--id",
+            &gid,
+            "--identity",
+            sp,
+            "--secret",
+            SECRET,
+            "--claim-kind",
+            "sqlite_wal_state",
+            "--subject-id",
+            "labelwatch/foo",
+            "--audience",
+            "nq:main",
+            "--jti",
+            jti,
+        ]))
+    };
+
+    // A verified non-genesis principal still cannot install a freeze.
+    let (ok, _o, e) = run(standing().args([
+        "--db",
+        dbp,
+        "policy",
+        "freeze",
+        "--handle",
+        "inc-impostor",
+        "--class-type",
+        "claim_kind",
+        "--class-value",
+        "sqlite_wal_state",
+        "--reason",
+        "unauthorized",
+        "--identity",
+        ip,
+        "--secret",
+        SECRET,
     ]));
+    assert!(!ok);
+    assert!(
+        e.contains("requires genesis operator wl:operator:laptop"),
+        "{e}"
+    );
 
     // Freeze the claim_kind class.
     let (ok, _o, e) = run(standing().args([
-        "--db", dbp, "policy", "freeze", "--handle", "inc-1",
-        "--class-type", "claim_kind", "--class-value", "sqlite_wal_state",
-        "--reason", "storage incident", "--identity", opp, "--secret", SECRET,
+        "--db",
+        dbp,
+        "policy",
+        "freeze",
+        "--handle",
+        "inc-1",
+        "--class-type",
+        "claim_kind",
+        "--class-value",
+        "sqlite_wal_state",
+        "--reason",
+        "storage incident",
+        "--identity",
+        opp,
+        "--secret",
+        SECRET,
     ]));
     assert!(ok, "freeze failed: {e}");
 
     // Spend refused with class_frozen.
     let (ok, _o, e) = prove("f1");
     assert!(!ok);
-    assert!(e.contains("class frozen"), "expected class_frozen, got: {e}");
+    assert!(
+        e.contains("class frozen"),
+        "expected class_frozen, got: {e}"
+    );
 
     // List shows the active freeze.
     let (ok, out, _) = run(standing().args(["--db", dbp, "policy", "list-freezes"]));
     assert!(ok);
     assert!(out.contains("inc-1"));
 
-    // Thaw, then the same lease spends again.
+    // A non-genesis principal cannot thaw it, and the freeze remains active.
     let (ok, _o, e) = run(standing().args([
-        "--db", dbp, "policy", "thaw", "--handle", "inc-1", "--identity", opp, "--secret", SECRET,
+        "--db",
+        dbp,
+        "policy",
+        "thaw",
+        "--handle",
+        "inc-1",
+        "--identity",
+        ip,
+        "--secret",
+        SECRET,
+    ]));
+    assert!(!ok);
+    assert!(
+        e.contains("requires genesis operator wl:operator:laptop"),
+        "{e}"
+    );
+    let (ok, _o, e) = prove("f-still-frozen");
+    assert!(!ok);
+    assert!(e.contains("class frozen"), "{e}");
+
+    // Genesis operator thaw, then the same lease spends again.
+    let (ok, _o, e) = run(standing().args([
+        "--db",
+        dbp,
+        "policy",
+        "thaw",
+        "--handle",
+        "inc-1",
+        "--identity",
+        opp,
+        "--secret",
+        SECRET,
     ]));
     assert!(ok, "thaw failed: {e}");
     let (ok, out, _) = prove("f2");
     assert!(ok, "spend after thaw should succeed");
     assert!(out.contains("spend #1"));
+
+    // `action` is a supported freeze class for act grants.
+    let (ok, _o, e) = run(standing().args([
+        "--db",
+        dbp,
+        "policy",
+        "freeze",
+        "--handle",
+        "inc-action",
+        "--class-type",
+        "action",
+        "--class-value",
+        "deploy",
+        "--reason",
+        "deploy pause",
+        "--identity",
+        opp,
+        "--secret",
+        SECRET,
+    ]));
+    assert!(ok, "action-class freeze failed: {e}");
 }

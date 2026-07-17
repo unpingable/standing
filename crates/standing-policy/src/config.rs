@@ -75,8 +75,11 @@ impl StaticConfig {
         audience: &str,
         now: DateTime<Utc>,
     ) -> MatchOutcome<'_> {
-        let actor_entries: Vec<&StaticConfigEntry> =
-            self.entries.iter().filter(|e| e.actor == actor_id).collect();
+        let actor_entries: Vec<&StaticConfigEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.actor == actor_id)
+            .collect();
 
         if actor_entries.is_empty() {
             return MatchOutcome::NoActor;
@@ -169,9 +172,10 @@ impl StaticConfigEntry {
         now: DateTime<Utc>,
     ) -> Classification {
         if let Some(exp) = self.expires_at
-            && now >= exp {
-                return Classification::Expired;
-            }
+            && now >= exp
+        {
+            return Classification::Expired;
+        }
         if self.claim_kind != claim_kind {
             return Classification::ClaimKindMismatch;
         }

@@ -1,7 +1,12 @@
 # Standing — Synthetic Boundary Probes
 
-> Standing is not yet active. These probes do not describe current Standing
-> behavior. They do not authorize implementation. They do not define policy.
+> **Status:** Historical pre-policy fence line. Standing is now active and its
+> entitlement-to-assert surface is implemented; the prose below preserves the
+> proposal-era context and does not describe current behavior. The non-transfer
+> of authority these probes defend remains valid.
+>
+> **Historical premise:** Standing was not yet active when these probes were
+> filed. They did not authorize implementation or define policy.
 >
 > They record future admissibility boundaries so Standing does not inherit
 > authority from Agent Governor, Nightshift, or observatory-family practice

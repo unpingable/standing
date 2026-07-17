@@ -161,9 +161,7 @@ pub fn create_identity(
     let audience = opts.audience.clone();
     let kid = opts.kid.clone();
 
-    let signature = sign(SCHEMA_VERSION, &kid, &jti, &name, &location, &audience, &issued_at, &expires_at, secret)?;
-
-    Ok(WorkloadId {
+    let mut identity = WorkloadId {
         schema_version: SCHEMA_VERSION,
         kid,
         jti,
@@ -172,8 +170,11 @@ pub fn create_identity(
         audience,
         issued_at,
         expires_at,
-        signature,
-    })
+        signature: String::new(),
+    };
+    identity.signature = sign(&identity, secret)?;
+
+    Ok(identity)
 }
 
 /// Verify a workload identity: version, signature, expiry, audience.
@@ -182,11 +183,7 @@ pub fn create_identity(
 /// The `secret` parameter is the key material for the claim's `kid`.
 /// Callers should resolve kid → secret before calling this function.
 /// If the kid is unknown, return `AssessmentResult::UnknownKeyId` directly.
-pub fn verify_identity(
-    id: &WorkloadId,
-    secret: &[u8],
-    opts: &VerifyOptions,
-) -> AssessmentResult {
+pub fn verify_identity(id: &WorkloadId, secret: &[u8], opts: &VerifyOptions) -> AssessmentResult {
     // Step 0: Schema version — reject unknown versions before anything else.
     // This is the one check that must survive all future evolution.
     if id.schema_version != SCHEMA_VERSION {
@@ -194,10 +191,7 @@ pub fn verify_identity(
     }
 
     // Step 1: Signature (includes schema_version and kid in the MAC)
-    let expected = match sign(
-        id.schema_version, &id.kid, &id.jti, &id.name, &id.location, &id.audience,
-        &id.issued_at, &id.expires_at, secret,
-    ) {
+    let expected = match sign(id, secret) {
         Ok(s) => s,
         Err(_) => return AssessmentResult::AssessmentCompromised,
     };
@@ -306,7 +300,9 @@ pub fn verify_and_resolve_with_replay(
         _ => Err(IdentityError::Assessment {
             detail: format!(
                 "workload {} (aud: {}, exp: {})",
-                id.name, id.audience, id.expires_at.to_rfc3339()
+                id.name,
+                id.audience,
+                id.expires_at.to_rfc3339()
             ),
             result,
         }),
@@ -347,36 +343,26 @@ pub trait ReplayGuard {
     fn purge_expired(&mut self) -> Result<u64, String>;
 }
 
-fn sign(
-    schema_version: u32,
-    kid: &str,
-    jti: &str,
-    name: &str,
-    location: &str,
-    audience: &str,
-    issued_at: &DateTime<Utc>,
-    expires_at: &DateTime<Utc>,
-    secret: &[u8],
-) -> Result<String, IdentityError> {
+fn sign(id: &WorkloadId, secret: &[u8]) -> Result<String, IdentityError> {
     let mut mac =
         HmacSha256::new_from_slice(secret).map_err(|e| IdentityError::Hmac(e.to_string()))?;
     // schema_version and kid are part of the signed payload —
     // changing either invalidates the signature.
-    mac.update(schema_version.to_string().as_bytes());
+    mac.update(id.schema_version.to_string().as_bytes());
     mac.update(b"|");
-    mac.update(kid.as_bytes());
+    mac.update(id.kid.as_bytes());
     mac.update(b"|");
-    mac.update(jti.as_bytes());
+    mac.update(id.jti.as_bytes());
     mac.update(b"|");
-    mac.update(name.as_bytes());
+    mac.update(id.name.as_bytes());
     mac.update(b"|");
-    mac.update(location.as_bytes());
+    mac.update(id.location.as_bytes());
     mac.update(b"|");
-    mac.update(audience.as_bytes());
+    mac.update(id.audience.as_bytes());
     mac.update(b"|");
-    mac.update(issued_at.to_rfc3339().as_bytes());
+    mac.update(id.issued_at.to_rfc3339().as_bytes());
     mac.update(b"|");
-    mac.update(expires_at.to_rfc3339().as_bytes());
+    mac.update(id.expires_at.to_rfc3339().as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
@@ -415,7 +401,10 @@ pub struct SingleKey {
 
 impl SingleKey {
     pub fn new(kid: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
-        Self { kid: kid.into(), secret: secret.into() }
+        Self {
+            kid: kid.into(),
+            secret: secret.into(),
+        }
     }
 
     /// The conventional default-kid single key.
@@ -543,7 +532,10 @@ mod tests {
     // -- key rotation (Phase 5) ------------------------------------------
 
     fn id_with_kid(kid: &str, secret: &[u8]) -> WorkloadId {
-        let opts = CreateOptions { kid: kid.to_string(), ..default_opts() };
+        let opts = CreateOptions {
+            kid: kid.to_string(),
+            ..default_opts()
+        };
         create_identity("bot", "host-1", secret, &opts).unwrap()
     }
 
@@ -551,7 +543,10 @@ mod tests {
     fn verifies_under_primary_key() {
         let id = id_with_kid("v2", SECRET);
         let keys = KeySet::new("v2", SECRET.to_vec());
-        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::Valid);
+        assert_eq!(
+            verify_identity_with_keys(&id, &keys, &default_verify()),
+            AssessmentResult::Valid
+        );
     }
 
     #[test]
@@ -560,7 +555,10 @@ mod tests {
         // but keeps v1 live as legacy.
         let id = id_with_kid("v1", SECRET);
         let keys = KeySet::new("v2", b"new-primary".to_vec()).with_legacy("v1", SECRET.to_vec());
-        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::Valid);
+        assert_eq!(
+            verify_identity_with_keys(&id, &keys, &default_verify()),
+            AssessmentResult::Valid
+        );
     }
 
     #[test]
@@ -568,7 +566,10 @@ mod tests {
         let id = id_with_kid("v1", SECRET);
         // Verifier has dropped v1 entirely.
         let keys = KeySet::new("v2", b"new-primary".to_vec());
-        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::UnknownKeyId);
+        assert_eq!(
+            verify_identity_with_keys(&id, &keys, &default_verify()),
+            AssessmentResult::UnknownKeyId
+        );
     }
 
     #[test]
@@ -577,16 +578,25 @@ mod tests {
         // kid matches but the secret is wrong → signature failure, distinct
         // from "we don't hold that key."
         let keys = KeySet::new("v2", b"wrong".to_vec());
-        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::InvalidSignature);
+        assert_eq!(
+            verify_identity_with_keys(&id, &keys, &default_verify()),
+            AssessmentResult::InvalidSignature
+        );
     }
 
     #[test]
     fn single_key_resolver_only_matches_its_kid() {
         let id = id_with_kid("default", SECRET);
         let keys = SingleKey::default_kid(SECRET.to_vec());
-        assert_eq!(verify_identity_with_keys(&id, &keys, &default_verify()), AssessmentResult::Valid);
+        assert_eq!(
+            verify_identity_with_keys(&id, &keys, &default_verify()),
+            AssessmentResult::Valid
+        );
         let other = SingleKey::new("other", SECRET.to_vec());
-        assert_eq!(verify_identity_with_keys(&id, &other, &default_verify()), AssessmentResult::UnknownKeyId);
+        assert_eq!(
+            verify_identity_with_keys(&id, &other, &default_verify()),
+            AssessmentResult::UnknownKeyId
+        );
     }
 
     #[test]
@@ -606,24 +616,36 @@ mod tests {
 
     #[test]
     fn expired_identity_rejected() {
-        let opts = CreateOptions { ttl_secs: 1, ..default_opts() };
+        let opts = CreateOptions {
+            ttl_secs: 1,
+            ..default_opts()
+        };
         let id = create_identity("bot", "host-1", SECRET, &opts).unwrap();
 
         // Verify at now + 60s (well past 1s TTL + 30s skew)
         let future = Utc::now() + Duration::seconds(60);
-        let vopts = VerifyOptions { now: Some(future), ..default_verify() };
+        let vopts = VerifyOptions {
+            now: Some(future),
+            ..default_verify()
+        };
         let result = verify_identity(&id, SECRET, &vopts);
         assert_eq!(result, AssessmentResult::Expired);
     }
 
     #[test]
     fn not_yet_expired_within_skew_accepted() {
-        let opts = CreateOptions { ttl_secs: 1, ..default_opts() };
+        let opts = CreateOptions {
+            ttl_secs: 1,
+            ..default_opts()
+        };
         let id = create_identity("bot", "host-1", SECRET, &opts).unwrap();
 
         // Verify at now + 2s — past TTL but within 30s skew
         let near_future = Utc::now() + Duration::seconds(2);
-        let vopts = VerifyOptions { now: Some(near_future), ..default_verify() };
+        let vopts = VerifyOptions {
+            now: Some(near_future),
+            ..default_verify()
+        };
         let result = verify_identity(&id, SECRET, &vopts);
         assert_eq!(result, AssessmentResult::Valid);
     }
@@ -666,7 +688,10 @@ mod tests {
 
         // Verify as if we're 60s in the past (beyond 30s skew, within 300s divergence)
         let past = Utc::now() - Duration::seconds(60);
-        let vopts = VerifyOptions { now: Some(past), ..default_verify() };
+        let vopts = VerifyOptions {
+            now: Some(past),
+            ..default_verify()
+        };
         let result = verify_identity(&id, SECRET, &vopts);
         assert_eq!(result, AssessmentResult::NotYetValid);
     }
@@ -682,10 +707,7 @@ mod tests {
         let bad_expires = id.issued_at - Duration::seconds(100);
         // Re-sign with the bad expiry so signature is valid
         id.expires_at = bad_expires;
-        id.signature = sign(
-            id.schema_version, &id.kid, &id.jti, &id.name, &id.location, &id.audience,
-            &id.issued_at, &id.expires_at, SECRET,
-        ).unwrap();
+        id.signature = sign(&id, SECRET).unwrap();
 
         let result = verify_identity(&id, SECRET, &default_verify());
         assert_eq!(result, AssessmentResult::AssessmentCompromised);
@@ -697,7 +719,10 @@ mod tests {
 
         // Verifier clock is 10 minutes behind issuer (beyond 300s max divergence)
         let way_past = Utc::now() - Duration::seconds(601);
-        let vopts = VerifyOptions { now: Some(way_past), ..default_verify() };
+        let vopts = VerifyOptions {
+            now: Some(way_past),
+            ..default_verify()
+        };
         let result = verify_identity(&id, SECRET, &vopts);
         assert_eq!(result, AssessmentResult::AssessmentCompromised);
     }
@@ -709,7 +734,10 @@ mod tests {
         // Verifier clock is 10 minutes ahead of issuer (beyond 300s max divergence)
         // But identity is not yet expired (1hr TTL), so this is clock uncertainty
         let way_future = Utc::now() + Duration::seconds(601);
-        let vopts = VerifyOptions { now: Some(way_future), ..default_verify() };
+        let vopts = VerifyOptions {
+            now: Some(way_future),
+            ..default_verify()
+        };
         let result = verify_identity(&id, SECRET, &vopts);
         // Within the identity's lifetime but beyond divergence budget —
         // we can't trust our temporal assessment
@@ -720,13 +748,19 @@ mod tests {
     fn extreme_divergence_but_clearly_expired_is_expired() {
         // If the identity is so old that even accounting for max divergence
         // it's definitely expired, we can say Expired with confidence
-        let opts = CreateOptions { ttl_secs: 10, ..default_opts() };
+        let opts = CreateOptions {
+            ttl_secs: 10,
+            ..default_opts()
+        };
         let id = create_identity("bot", "host-1", SECRET, &opts).unwrap();
 
         // Verifier is 20 minutes in the future — way beyond divergence,
         // but also way beyond the 10s TTL + 300s divergence budget
         let way_future = Utc::now() + Duration::seconds(1200);
-        let vopts = VerifyOptions { now: Some(way_future), ..default_verify() };
+        let vopts = VerifyOptions {
+            now: Some(way_future),
+            ..default_verify()
+        };
         let result = verify_identity(&id, SECRET, &vopts);
         assert_eq!(result, AssessmentResult::Expired);
     }
@@ -754,7 +788,9 @@ mod tests {
         assert_eq!(verified.audience, "standing");
         assert!(!verified.jti.is_empty());
         // Issuer time should be close to verifier time
-        let diff = (verified.verifier_time - verified.issuer_time).num_seconds().abs();
+        let diff = (verified.verifier_time - verified.issuer_time)
+            .num_seconds()
+            .abs();
         assert!(diff < 5);
     }
 
