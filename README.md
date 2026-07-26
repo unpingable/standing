@@ -1,5 +1,21 @@
 # standing
 
+> **Status (2026-07-26): the Standing / mandate-custody office —
+> separately instantiated, not part of the current operational vertical.**
+> This repository implements the jurisdiction "may this actor act or assert,
+> now, under what mandate — with expiry, revocation, replay-refusal, and
+> delegation denied by default." It is **not absorbed** by AG ng or Docket:
+> AG ng's authorization rests on an asserted principal-authentication
+> premise (not mandate custody), and Docket's local standing is a
+> domain-local execution capability, not the mandate. Its consumers are the
+> classic lineage (AG classic `standing_client`, transition-kernel
+> `StandingOutput`) at lab-backed strength — "lab-backed compatibility
+> evidence, not live testimony" remains the honest bar. "**Mandate Custody
+> (MC)**" is this office's operator-ratified (2026-07-17) but **unexecuted**
+> rename (`RENAME-MANDATE-CUSTODY.md`); wire IDs `standing.*` survive any
+> rename. New features on its own roadmap remain welcome; nothing here is
+> deprecated.
+
 Observable standing/entitlement for automation and workloads.
 
 Modern systems are good at proving possession of credentials. They are much worse at proving entitlement to consequence.
