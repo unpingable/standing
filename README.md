@@ -109,6 +109,9 @@ Re-verify at every consequence-bearing gate.
 - Resolves assertion standing in advisory or binding mode, with replay and
   request-body binding on the binding path
 - Freezes and thaws grant classes as a receipt-bearing incident-mode overlay
+- Issues exact `substrate_incarnation` continuity-edge warrants and signs an
+  immutable pre-provider NQ acquisition commitment; see
+  [`docs/continuity-authority-carrier.md`](docs/continuity-authority-carrier.md)
 - Stores everything in SQLite with fail-closed atomic transitions
 
 ## What this is not
@@ -213,12 +216,16 @@ Receipt format: canonical JSON (RFC 8785 / JCS) + SHA-256. WLP-compatible.
 ## Limitations
 
 The fail-closed chain is only as strong as the identity substrate beneath it.
-Standing verifies workload identity and request proofs with symmetric HMAC
-keys. `kid`-based lookup and primary/legacy rotation are implemented, but key
-distribution, storage, and asymmetric trust remain outside Standing. Receipts
-inherit the cryptographic strength of that substrate, not more; see
+Standing verifies ordinary workload identity and assertion request proofs with
+symmetric HMAC keys. The continuity-authority export is a deliberately narrow
+exception: it uses Ed25519 so NQ and Nightshift receive verifier material rather
+than authority-minting material. In both paths, key distribution, private-key
+storage, rotation, and designated-host isolation remain environmental gates.
+Receipts inherit the cryptographic strength of their substrate, not more; see
 [`docs/component-key-keytab.md`](docs/component-key-keytab.md) and
-[`docs/compromise-recovery.md`](docs/compromise-recovery.md).
+[`docs/compromise-recovery.md`](docs/compromise-recovery.md), plus the carrier's
+explicit deployment limits in
+[`docs/continuity-authority-carrier.md`](docs/continuity-authority-carrier.md).
 
 Standing is also a single point of authority by design. Authority unreachable means fail-closed means nothing acts. For consequence-bearing operations that is the correct polarity. A future proposal to "cache standing decisions for resilience" is the bearer-token failure mode sneaking back in through the availability door, and is refused by the no-cache-without-lease invariant above.
 

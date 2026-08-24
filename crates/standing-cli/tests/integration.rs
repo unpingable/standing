@@ -46,6 +46,12 @@ fn run(cmd: &mut Command) -> (bool, String, String) {
     )
 }
 
+fn temp_text(contents: &str) -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+    file
+}
+
 fn extract_grant_id(stdout: &str) -> String {
     // "granted <uuid>" or "denied <uuid>"
     stdout
@@ -59,6 +65,146 @@ fn extract_grant_id(stdout: &str) -> String {
 }
 
 const SECRET: &str = "integration-test-secret";
+
+#[test]
+fn continuity_cli_issues_and_commits_before_provider_with_exact_replay() {
+    let db = temp_db();
+    let db_path = db.path().to_str().unwrap();
+    let operator = temp_identity("operator", "laptop", SECRET);
+    let nq = temp_identity("nq", "test", SECRET);
+    let operator_path = operator.path().to_str().unwrap();
+    let nq_path = nq.path().to_str().unwrap();
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "genesis",
+        "install",
+        "--identity",
+        operator_path,
+        "--secret",
+        SECRET,
+    ]));
+    assert!(ok, "genesis install failed: {stderr}");
+
+    let signing_key = temp_text(&"11".repeat(32));
+    let issue_request = temp_text(
+        &serde_json::json!({
+            "schema": "standing.continuity_authority_issuance_request.v1",
+            "issuance_request_id": "00000000-0000-0000-0000-000000000001",
+            "replay_identity": "issue:test-office:a-to-b",
+            "edge": {
+                "subject_ref": "observer:test-office",
+                "relation": "substrate_incarnation",
+                "predecessor_ref": "substrate:test-a",
+                "successor_ref": "substrate:test-b"
+            },
+            "nq_audience": "wl:nq:test"
+        })
+        .to_string(),
+    );
+    let (ok, stdout, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "continuity",
+        "issue",
+        "--request",
+        issue_request.path().to_str().unwrap(),
+        "--operator-identity",
+        operator_path,
+        "--operator-secret",
+        SECRET,
+        "--signing-key",
+        signing_key.path().to_str().unwrap(),
+        "--key-id",
+        "standing.test.v1",
+    ]));
+    assert!(ok, "continuity issue failed: {stderr}");
+    let issued: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(issued["replayed"], false);
+    let authority_id = issued["authority"]["payload"]["authority_occurrence_ref"]
+        .as_str()
+        .unwrap();
+    let authority_digest = issued["authority"]["payload_digest"].as_str().unwrap();
+
+    let commit_request = temp_text(
+        &serde_json::json!({
+            "schema": "standing.continuity_acquisition_commitment_request.v1",
+            "request_id": "00000000-0000-0000-0000-000000000002",
+            "replay_identity": "commit:acquisition-test-1",
+            "authority_occurrence_ref": authority_id,
+            "authority_payload_digest": authority_digest,
+            "acquisition_id": "acquisition:test-1",
+            "acquisition_basis_digest": "cc".repeat(32),
+            "nq_audience": "wl:nq:test"
+        })
+        .to_string(),
+    );
+    let commit_args = [
+        "--db",
+        db_path,
+        "continuity",
+        "commit-acquisition",
+        "--request",
+        commit_request.path().to_str().unwrap(),
+        "--nq-identity",
+        nq_path,
+        "--nq-secret",
+        SECRET,
+        "--signing-key",
+        signing_key.path().to_str().unwrap(),
+        "--key-id",
+        "standing.test.v1",
+    ];
+    let (ok, stdout, stderr) = run(standing().args(commit_args));
+    assert!(ok, "continuity commitment failed: {stderr}");
+    let first: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(first["replayed"], false);
+    assert_eq!(
+        first["bundle"]["commitment"]["payload"]["acquisition_id"],
+        "acquisition:test-1"
+    );
+
+    let (ok, stdout, stderr) = run(standing().args(commit_args));
+    assert!(ok, "exact commitment replay failed: {stderr}");
+    let replay: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["bundle"], first["bundle"]);
+
+    let changed_request = temp_text(
+        &serde_json::json!({
+            "schema": "standing.continuity_acquisition_commitment_request.v1",
+            "request_id": "00000000-0000-0000-0000-000000000002",
+            "replay_identity": "commit:acquisition-test-1",
+            "authority_occurrence_ref": authority_id,
+            "authority_payload_digest": authority_digest,
+            "acquisition_id": "acquisition:test-1",
+            "acquisition_basis_digest": "dd".repeat(32),
+            "nq_audience": "wl:nq:test"
+        })
+        .to_string(),
+    );
+    let (ok, _, stderr) = run(standing().args([
+        "--db",
+        db_path,
+        "continuity",
+        "commit-acquisition",
+        "--request",
+        changed_request.path().to_str().unwrap(),
+        "--nq-identity",
+        nq_path,
+        "--nq-secret",
+        SECRET,
+        "--signing-key",
+        signing_key.path().to_str().unwrap(),
+        "--key-id",
+        "standing.test.v1",
+    ]));
+    assert!(!ok);
+    assert!(
+        stderr.contains("replay conflicts"),
+        "unexpected refusal: {stderr}"
+    );
+}
 
 // ---------------------------------------------------------------
 // Identity

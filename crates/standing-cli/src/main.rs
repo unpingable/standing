@@ -1,4 +1,8 @@
 use clap::{Parser, Subcommand};
+use standing_continuity::{
+    ContinuityAcquisitionCommitmentRequestV1, ContinuityAuthorityIssuanceRequestV1,
+    ContinuitySigner,
+};
 use standing_grant::{
     ActorContext, AssertionGrantRequest, AssertionGrantState, AssertionScope, GrantRequest,
     GrantScope, GrantState, Principal, RequestProof,
@@ -66,6 +70,72 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
+    },
+    /// Issue exact substrate-incarnation warrants and commit them as NQ
+    /// acquisition prerequisites. These are permissions, not observations.
+    Continuity {
+        #[command(subcommand)]
+        action: ContinuityAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContinuityAction {
+    /// Issue and export one signed exact continuity-edge warrant.
+    Issue {
+        /// JSON file containing a standing.continuity_authority_issuance_request.v1.
+        #[arg(long)]
+        request: String,
+        #[arg(long, name = "operator-identity")]
+        operator_identity: String,
+        #[arg(long, name = "operator-secret")]
+        operator_secret: String,
+        /// File containing exactly one 32-byte Ed25519 signing seed in hex.
+        #[arg(long, name = "signing-key")]
+        signing_key: String,
+        #[arg(long, name = "key-id")]
+        key_id: String,
+    },
+    /// Atomically bind an issued warrant to a preallocated NQ acquisition.
+    /// This must complete before NQ invokes its provider.
+    CommitAcquisition {
+        /// JSON file containing the exact commitment request.
+        #[arg(long)]
+        request: String,
+        /// Authenticated NQ workload identity; its principal must exactly equal
+        /// the request's instance-qualified nq_audience.
+        #[arg(long, name = "nq-identity")]
+        nq_identity: String,
+        #[arg(long, name = "nq-secret")]
+        nq_secret: String,
+        #[arg(long, name = "signing-key")]
+        signing_key: String,
+        #[arg(long, name = "key-id")]
+        key_id: String,
+    },
+    /// Revoke a warrant for future acquisition commitments. Historical exact
+    /// commitments remain proof of what was usable when committed.
+    Revoke {
+        #[arg(long, name = "authority-occurrence-ref")]
+        authority_occurrence_ref: uuid::Uuid,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, name = "operator-identity")]
+        operator_identity: String,
+        #[arg(long, name = "operator-secret")]
+        operator_secret: String,
+    },
+    /// Inspect the immutable signed authority and current issuance standing.
+    Show {
+        #[arg(long, name = "authority-occurrence-ref")]
+        authority_occurrence_ref: uuid::Uuid,
+    },
+    /// Derive the public verifier material for a configured signing seed.
+    PublicKey {
+        #[arg(long, name = "signing-key")]
+        signing_key: String,
+        #[arg(long, name = "key-id")]
+        key_id: String,
     },
 }
 
@@ -470,6 +540,7 @@ fn main() {
         Commands::Genesis { action } => handle_genesis(&cli.db, action),
         Commands::Assert { action } => handle_assert(&cli.db, action),
         Commands::Policy { action } => handle_policy(&cli.db, action),
+        Commands::Continuity { action } => handle_continuity(&cli.db, action),
     };
 
     if let Err(e) = result {
@@ -494,6 +565,110 @@ fn resolve_identity(
         .map_err(|e| format!("identity verification failed: {e}"))?;
     let principal = Principal::new(verified.principal_id, verified.label);
     Ok((principal, wid))
+}
+
+fn read_bounded_text(path: &str, max_bytes: u64) -> Result<String, Box<dyn std::error::Error>> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("cannot stat input file {path}: {e}"))?;
+    if metadata.len() > max_bytes {
+        return Err(format!("input file {path} exceeds {max_bytes} bytes").into());
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("cannot read input file {path}: {e}").into())
+}
+
+fn load_continuity_signer(
+    key_id: String,
+    path: &str,
+) -> Result<ContinuitySigner, Box<dyn std::error::Error>> {
+    let seed_hex = read_bounded_text(path, 1024)?;
+    Ok(ContinuitySigner::from_seed_hex(key_id, seed_hex.trim())?)
+}
+
+fn handle_continuity(
+    db_path: &str,
+    action: ContinuityAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        ContinuityAction::Issue {
+            request,
+            operator_identity,
+            operator_secret,
+            signing_key,
+            key_id,
+        } => {
+            let request: ContinuityAuthorityIssuanceRequestV1 =
+                serde_json::from_str(&read_bounded_text(&request, 64 * 1024)?)?;
+            let (operator, _) = resolve_identity(&operator_identity, &operator_secret, None)?;
+            let signer = load_continuity_signer(key_id, &signing_key)?;
+            let mut store = Store::open(db_path)?;
+            let result = store.issue_continuity_authority(
+                &request,
+                &operator,
+                &signer,
+                chrono::Utc::now(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        ContinuityAction::CommitAcquisition {
+            request,
+            nq_identity,
+            nq_secret,
+            signing_key,
+            key_id,
+        } => {
+            let request: ContinuityAcquisitionCommitmentRequestV1 =
+                serde_json::from_str(&read_bounded_text(&request, 64 * 1024)?)?;
+            let (nq, _) = resolve_identity(&nq_identity, &nq_secret, None)?;
+            let signer = load_continuity_signer(key_id, &signing_key)?;
+            let mut store = Store::open(db_path)?;
+            let result =
+                store.commit_continuity_acquisition(&request, &nq, &signer, chrono::Utc::now())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        ContinuityAction::Revoke {
+            authority_occurrence_ref,
+            reason,
+            operator_identity,
+            operator_secret,
+        } => {
+            let (operator, _) = resolve_identity(&operator_identity, &operator_secret, None)?;
+            let mut store = Store::open(db_path)?;
+            let receipt = store.revoke_continuity_authority(
+                authority_occurrence_ref,
+                &operator,
+                &reason,
+                chrono::Utc::now(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        ContinuityAction::Show {
+            authority_occurrence_ref,
+        } => {
+            let store = Store::open(db_path)?;
+            let authority = store
+                .get_continuity_authority(authority_occurrence_ref)?
+                .ok_or_else(|| {
+                    format!("continuity authority not found: {authority_occurrence_ref}")
+                })?;
+            println!("{}", serde_json::to_string_pretty(&authority)?);
+        }
+        ContinuityAction::PublicKey {
+            signing_key,
+            key_id,
+        } => {
+            let signer = load_continuity_signer(key_id, &signing_key)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": "standing.continuity_verifier.v1",
+                    "key_id": signer.key_id(),
+                    "public_key_hex": signer.verifying_key_hex(),
+                    "algorithm": "Ed25519",
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn handle_identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Error>> {

@@ -22,6 +22,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Continuity authority boundary
+        run: ./scripts/check-continuity-authority-boundary.sh
       - name: Build
         run: cargo build --workspace --all-targets --all-features
       - name: Test

@@ -51,6 +51,15 @@ pub enum ReceiptKind {
     /// NOT the lease's witness — it cites the prior `AssertionGrantIssued`
     /// receipt as authority (L3: no retroactive standing).
     AssertionMade,
+    /// A closed, exact continuity-edge warrant was issued under this Standing
+    /// instance's genesis mandate. The warrant is permission, not evidence
+    /// that the transition occurred.
+    ContinuityAuthorityIssued,
+    /// An exact NQ acquisition request committed an existing continuity
+    /// authority before provider invocation.
+    ContinuityAcquisitionCommitted,
+    /// A continuity authority was revoked for future acquisition commitments.
+    ContinuityAuthorityRevoked,
     /// A policy decision was made
     PolicyDecision,
     /// A policy-level freeze was installed over a grant class (incident mode).

@@ -12,6 +12,7 @@ standing-receipt = { workspace = true }
 standing-grant = { workspace = true }
 standing-policy = { workspace = true }
 standing-identity = { workspace = true }
+standing-continuity = { workspace = true }
 standing-store = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

@@ -7,10 +7,14 @@
 //! Invariant: no state transition without a valid receipt, no receipt without
 //! a valid transition. Both are written atomically or neither is.
 
+mod continuity;
 pub mod replay;
 mod resolve;
 mod store_resolver;
 
+pub use continuity::{
+    ContinuityAuthorityIssueResult, ContinuityAuthorityRow, ContinuityCommitResult,
+};
 pub use store_resolver::StoreResolver;
 
 use chrono::{DateTime, Utc};
@@ -44,6 +48,35 @@ pub enum StoreError {
 
     #[error("policy evaluation error: {0}")]
     Policy(#[from] PolicyError),
+
+    #[error("continuity authority error: {0}")]
+    Continuity(#[from] standing_continuity::ContinuityError),
+
+    #[error("continuity authority not found: {0}")]
+    ContinuityAuthorityNotFound(String),
+
+    #[error("continuity request replay conflicts with the immutable stored request: {0}")]
+    ContinuityReplayConflict(String),
+
+    #[error("continuity authority {0} is revoked for new acquisition commitments")]
+    ContinuityAuthorityRevoked(String),
+
+    #[error("continuity authority audience mismatch: expected {expected}, got {actual}")]
+    ContinuityAudienceMismatch { expected: String, actual: String },
+
+    #[error("continuity authority signer mismatch: expected {expected}, got {actual}")]
+    ContinuitySignerMismatch { expected: String, actual: String },
+
+    #[error("continuity authority digest mismatch: expected {expected}, got {actual}")]
+    ContinuityAuthorityDigestMismatch { expected: String, actual: String },
+
+    #[error(
+        "continuity commitment requester {actual} is not the authenticated NQ audience {expected}"
+    )]
+    ContinuityRequesterMismatch { expected: String, actual: String },
+
+    #[error("continuity authority receipt head changed concurrently")]
+    ContinuityHeadContended,
 
     #[error("policy witness does not match its decision field {field}")]
     PolicyWitnessMismatch { field: String },
@@ -281,6 +314,54 @@ impl Store {
                 thaw_receipt TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_freezes_class ON policy_freezes(class_type, class_value);
+
+            -- Exact continuity-edge warrants and their pre-provider acquisition
+            -- commitments. These are separate from grants and assertion leases:
+            -- a warrant permits reliance on one closed edge; it does not claim
+            -- that the transition occurred or that any observation is true.
+            CREATE TABLE IF NOT EXISTS continuity_authorities (
+                authority_occurrence_ref TEXT PRIMARY KEY,
+                issuance_request_id TEXT NOT NULL UNIQUE,
+                replay_identity TEXT NOT NULL UNIQUE,
+                request_digest TEXT NOT NULL,
+                subject_ref TEXT NOT NULL,
+                relation TEXT NOT NULL CHECK (relation = 'substrate_incarnation'),
+                predecessor_ref TEXT NOT NULL,
+                successor_ref TEXT NOT NULL,
+                nq_audience TEXT NOT NULL,
+                issuer_principal TEXT NOT NULL,
+                standing_instance TEXT NOT NULL,
+                standing_basis_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('issued', 'revoked')),
+                signing_key_id TEXT NOT NULL,
+                verifying_key_hex TEXT NOT NULL,
+                signed_authority_json TEXT NOT NULL,
+                payload_digest TEXT NOT NULL,
+                latest_receipt_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_continuity_edge
+                ON continuity_authorities(subject_ref, relation, predecessor_ref, successor_ref);
+
+            CREATE TABLE IF NOT EXISTS continuity_acquisition_commitments (
+                commitment_occurrence_ref TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                replay_identity TEXT NOT NULL UNIQUE,
+                request_digest TEXT NOT NULL,
+                authority_occurrence_ref TEXT NOT NULL,
+                authority_payload_digest TEXT NOT NULL,
+                acquisition_id TEXT NOT NULL UNIQUE,
+                acquisition_basis_digest TEXT NOT NULL,
+                nq_audience TEXT NOT NULL,
+                requester_principal TEXT NOT NULL,
+                signed_commitment_json TEXT NOT NULL,
+                payload_digest TEXT NOT NULL,
+                receipt_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(authority_occurrence_ref)
+                    REFERENCES continuity_authorities(authority_occurrence_ref)
+            );
             ",
         )?;
         Ok(())
